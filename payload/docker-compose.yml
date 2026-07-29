@@ -1,0 +1,61 @@
+services:
+  clouddrive2:
+    image: cloudnas/clouddrive2@sha256:5491c21fb14a5774576515f8483ecdbe2780bf525985f426785b99488e7cc09d
+    container_name: tg115-clouddrive2
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      CLOUDDRIVE_HOME: /Config
+    volumes:
+      - ./clouddrive/config:/Config
+      - ./clouddrive/mounts:/CloudNAS:shared
+    ports:
+      - "127.0.0.1:19798:19798"
+    devices:
+      - /dev/fuse:/dev/fuse
+    privileged: true
+    pid: host
+    restart: unless-stopped
+    networks:
+      - tg115
+
+  tg115-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg115-bot
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /data
+      DOWNLOAD_DIR: /downloads
+      LOG_DIR: /logs
+      RCLONE_CONFIG_PATH: /config/rclone/rclone.conf
+    user: "10001:10001"
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+      - ./logs:/logs
+      - ./config:/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    restart: unless-stopped
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 45s
+    networks:
+      - tg115
+
+networks:
+  tg115:
+    name: tg115
