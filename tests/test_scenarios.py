@@ -6,6 +6,7 @@ import base64
 import os
 import sys
 import tempfile
+import time
 import unittest
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +57,9 @@ def make_service(settings: Settings, db: TaskDB) -> TransferService:
     service._finalize_lock = asyncio.Lock()
     service.download_tasks = {}
     service.upload_tasks = {}
+    service._progress = {}
+    service._watch_messages = {}
+    service.destination_last_checked = time.time()
     return service
 
 
@@ -64,8 +68,10 @@ class FakeRclone:
         self.files: dict[str, bytes] = {}
         self.removed: list[str] = []
 
-    async def upload(self, local_path: Path, remote_path: str) -> None:
+    async def upload(self, local_path: Path, remote_path: str, *, progress=None) -> None:
         self.files[remote_path] = local_path.read_bytes()
+        if progress:
+            progress(local_path.stat().st_size, 1)
 
     async def open_upload_stream(self, remote_path: str, exact_size: int):
         owner = self
@@ -108,6 +114,14 @@ class FakeRclone:
     async def remove(self, remote_path: str) -> None:
         self.removed.append(remote_path)
         self.files.pop(remote_path, None)
+
+    async def list_staging_objects(self) -> list[tuple[int, str]]:
+        result = []
+        for name in self.files:
+            parts = name.split("-", 2)
+            if len(parts) == 3 and parts[0] == ".uploading" and parts[1].isdigit():
+                result.append((int(parts[1]), name))
+        return result
 
 
 class EndToEndSimulationTests(unittest.TestCase):
@@ -168,7 +182,7 @@ class EndToEndSimulationTests(unittest.TestCase):
                 text for text in notifications if "CloudDrive2 已接收" in text
             )
             self.assertIn("Bot 传输已完成", completion)
-            self.assertIn(f"/confirm #{task['id']}", completion)
+            self.assertIn("/confirm all", completion)
             self.assertNotIn("正在后台上传到 115", completion)
             db.close()
 
@@ -292,6 +306,11 @@ class EndToEndSimulationTests(unittest.TestCase):
                 transfer_mode="stream",
                 remote_path="large.mp4",
             )
+            reserved, _ = db.reserve(
+                task["id"], budget_bytes=1024, current_free_bytes=2048,
+                minimum_free_bytes=512,
+            )
+            self.assertTrue(reserved)
             service = make_service(settings, db)
             remote = FakeRclone()
             remote.files["large.mp4"] = payload
@@ -486,8 +505,8 @@ class EndToEndSimulationTests(unittest.TestCase):
                     "Bot 当前实际传输：下载/流式 0，落盘后上传 0",
                     text,
                 )
-                self.assertIn("Bot 传输已完成，115 官方端待确认 1", text)
-                self.assertIn("/confirm <编号>", text)
+                self.assertIn("Bot 传输已完成（CloudDrive2 已接收） 1", text)
+                self.assertIn("/confirm <编号|all>", text)
                 self.assertNotIn("115 后台处理中", text)
             finally:
                 db.close()
@@ -607,7 +626,7 @@ class QueueAndResourceSimulationTests(unittest.TestCase):
                     swap_used=0,
                     disk_free=settings.min_free_disk_bytes + 10 * mb,
                     network_bytes_per_second=10 * mb,
-                    sampled_at=0,
+                    sampled_at=time.time(),
                 )
                 service.destination_healthy = True
                 service.download_window = SimpleNamespace(value=5)

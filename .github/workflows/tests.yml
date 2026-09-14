@@ -34,10 +34,10 @@ jobs:
           python -m unittest discover -s tests -v
 
       - name: Ruff
-        run: uv run --with ruff==0.16.0 ruff check installer.py payload/app tests
+        run: uv run --with ruff==0.16.0 ruff check installer.py vps_resources.py payload/app tests
 
       - name: Bandit
-        run: uv run --with bandit==1.9.4 bandit -q -r payload/app installer.py
+        run: uv run --with bandit==1.9.4 bandit -q -r payload/app installer.py vps_resources.py
 
       - name: Dependency audit
         run: |
@@ -70,11 +70,22 @@ jobs:
       - name: ShellCheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck rclone python3-tk
           shellcheck \
+            payload/backup_retention.sh \
             payload/remote_install.sh \
             payload/repair_clouddrive_network.sh \
             payload/manage.sh
+
+      - name: Set up runtime Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+
+      - name: Linux runtime regression and real WebDAV integration
+        run: |
+          python -m pip install -r requirements-build.txt -r payload/requirements.txt
+          python -m unittest discover -s tests -v
 
       - name: Validate Compose
         run: |

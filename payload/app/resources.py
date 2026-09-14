@@ -64,6 +64,8 @@ class AdaptiveWindow:
         self.value = 1
         self._last_network_rate = 0.0
         self._high_pressure_cycles = 0
+        self._next_growth_at = 0.0
+        self._trial: tuple[int, float] | None = None
 
     @staticmethod
     def _memory_derived_ceiling(memory_available: int) -> int:
@@ -78,7 +80,12 @@ class AdaptiveWindow:
         recent_errors: int,
         destination_healthy: bool,
         demand_present: bool,
+        throughput: float | None = None,
+        active_count: int | None = None,
+        backlog_pressure: bool = False,
     ) -> int:
+        now = time.monotonic()
+        rate = snapshot.network_bytes_per_second if throughput is None else throughput
         memory_cap = self._memory_derived_ceiling(snapshot.memory_available)
         if (
             snapshot.memory_available < self.settings.memory_hard_min_bytes
@@ -89,7 +96,20 @@ class AdaptiveWindow:
             )
         ):
             self.value = 0
+            self._trial = None
             return self.value
+
+        if not demand_present:
+            self.value = 1
+            self._trial = None
+            return self.value
+
+        if self._trial is not None and now >= self._next_growth_at:
+            previous_value, previous_rate = self._trial
+            if previous_rate > 0 and rate < previous_rate * 1.05:
+                self.value = min(self.value, previous_value)
+                self._next_growth_at = now + max(30, self.settings.control_interval * 10)
+            self._trial = None
 
         if snapshot.cpu_percent >= self.settings.cpu_pressure or recent_errors >= 3:
             self._high_pressure_cycles += 1
@@ -100,6 +120,8 @@ class AdaptiveWindow:
             self.value = max(
                 1, math.floor(max(1, self.value) * self.settings.ramp_down_factor)
             )
+            self._trial = None
+            self._next_growth_at = now + max(10, self.settings.control_interval * 3)
         elif (
             (
                 snapshot.cpu_percent < self.settings.cpu_pressure
@@ -108,19 +130,26 @@ class AdaptiveWindow:
             or snapshot.memory_available < self.settings.memory_soft_min_bytes
         ):
             self.value = max(1, self.value - 1)
+            self._trial = None
+            self._next_growth_at = now + max(10, self.settings.control_interval * 3)
         elif (
             demand_present
             and snapshot.cpu_percent < self.settings.cpu_target_low
             and recent_errors == 0
+            and not backlog_pressure
+            and now >= self._next_growth_at
+            and (active_count is None or active_count >= max(1, self.value))
+            and rate > 0
         ):
             throughput_not_worse = (
                 self._last_network_rate <= 0
-                or snapshot.network_bytes_per_second
-                >= self._last_network_rate * 0.90
+                or rate >= self._last_network_rate * 0.90
             )
             if throughput_not_worse:
+                self._trial = (max(1, self.value), rate)
                 self.value += self.settings.ramp_up_step
+                self._next_growth_at = now + max(10, self.settings.control_interval * 3)
 
         self.value = min(max(1, self.value), memory_cap)
-        self._last_network_rate = snapshot.network_bytes_per_second
+        self._last_network_rate = rate
         return self.value

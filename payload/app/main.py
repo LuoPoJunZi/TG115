@@ -13,43 +13,14 @@ from typing import Any
 
 from telethon import TelegramClient, events
 
+from .bot_commands import CommandMixin, format_bytes
 from .config import Settings
 from .db import TaskDB
+from .interfaces import Destination, DestinationProbe, MediaSource
 from .naming import safe_file_name
 from .rclone_client import RcloneClient
 from .resources import AdaptiveWindow, ResourceMonitor, ResourceSnapshot
-
-STATE_LABELS = {
-    "queued": "在排队",
-    "reserved": "已放行，准备下载",
-    "downloading": "正在从 Telegram 下载",
-    "streaming": "正在从 Telegram 流式写入 CloudDrive2",
-    "downloaded": "下载完成，等待上传",
-    "waiting_upload": "下载完成，等待上传",
-    "uploading": "正在写入 CloudDrive2",
-    "verifying": "正在校验 CloudDrive2 文件",
-    "finalizing": "正在生成正式文件名",
-    "cleanup_pending": "CloudDrive2 已接收，正在清理 VPS 本地文件",
-    "completed": "Bot 传输已完成，115 官方端待确认",
-    "confirmed": "115 官方端已由你确认",
-    "download_failed": "下载失败",
-    "upload_failed_retained": "上传失败，本地文件已保留",
-    "verification_failed_retained": "校验失败，本地文件已保留",
-    "cancelled": "已取消",
-}
-
-
-def state_label(state: str) -> str:
-    return STATE_LABELS.get(state, state)
-
-
-def format_bytes(value: float) -> str:
-    size = float(value)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
-            return f"{size:.2f}{unit}"
-        size /= 1024
-    return f"{size:.2f}TB"
+from .states import FAILED_STATES
 
 
 def setup_logging(settings: Settings) -> None:
@@ -73,8 +44,11 @@ def setup_logging(settings: Settings) -> None:
     root.addHandler(file_handler)
 
 
-class TransferService:
-    def __init__(self, settings: Settings):
+class TransferService(CommandMixin):
+    def __init__(
+        self, settings: Settings, *, source: MediaSource | None = None,
+        destination: Destination | None = None,
+    ):
         self.settings = settings
         setup_logging(settings)
         self.log = logging.getLogger("tg115")
@@ -88,13 +62,18 @@ class TransferService:
             retry_delay=3,
             auto_reconnect=True,
         )
-        self.rclone = RcloneClient(settings)
+        self._source = source
+        self.rclone = destination or RcloneClient(settings)
         self.monitor = ResourceMonitor(settings.download_dir)
         self.download_window = AdaptiveWindow(settings, "download")
         self.upload_window = AdaptiveWindow(settings, "upload")
         self.snapshot: ResourceSnapshot | None = None
         self.destination_healthy = False
         self.destination_last_checked = 0.0
+        self.destination_scope = "unknown"
+        self.destination_error = "尚未检查"
+        self._progress: dict[int, dict[str, Any]] = {}
+        self._watch_messages: dict[int, Any] = {}
         self.download_tasks: dict[int, asyncio.Task[None]] = {}
         self.upload_tasks: dict[int, asyncio.Task[None]] = {}
         self.recent_download_errors: deque[float] = deque(maxlen=50)
@@ -102,7 +81,43 @@ class TransferService:
         self._background: list[asyncio.Task[Any]] = []
         self._stop = asyncio.Event()
         self._finalize_lock = asyncio.Lock()
+        self._orphan_cleanup_plan: dict[str, Any] | None = None
         self._register_handlers()
+
+    @property
+    def source(self) -> MediaSource:
+        return getattr(self, "_source", None) or self.client
+
+    def _sample_fresh(self) -> bool:
+        return bool(self.snapshot and 0 <= time.time() - self.snapshot.sampled_at
+                    <= max(10, self.settings.control_interval * 3))
+
+    def _destination_ready(self) -> bool:
+        return (self.destination_healthy and 0 <= time.time() - self.destination_last_checked
+                <= self.settings.remote_health_interval + 45)
+
+    def _stream_count(self) -> int:
+        return sum(1 for task_id in self.download_tasks
+                   if (self.db.get(task_id) or {}).get("transfer_mode") == "stream")
+
+    def _record_progress(
+        self, task_id: int, stage: str, count: int, speed: float | None = None,
+    ) -> None:
+        if not hasattr(self, "_progress"):
+            self._progress = {}
+        now = time.monotonic()
+        old = self._progress.get(task_id)
+        if not old or old["stage"] != stage or count < old["bytes"]:
+            old = {"stage": stage, "bytes": 0, "at": now, "started": now}
+        measured = (max(0, count - old["bytes"]) / (now - old["at"])) if now > old["at"] else 0
+        self._progress[task_id] = {
+            "stage": stage, "bytes": count, "at": now, "started": old["started"],
+            "speed": max(0, speed if speed is not None else measured),
+        }
+
+    def _stage_rate(self, stage: str) -> float:
+        return sum(p["speed"] for p in getattr(self, "_progress", {}).values()
+                   if p["stage"] == stage and time.monotonic() - p["at"] <= 20)
 
     def _register_handlers(self) -> None:
         self.client.add_event_handler(self._on_message, events.NewMessage(incoming=True))
@@ -123,8 +138,8 @@ class TransferService:
         return None
 
     async def _on_message(self, event: events.NewMessage.Event) -> None:
-        if not self._authorized(event.sender_id):
-            self.log.warning("忽略未授权用户：%s", event.sender_id)
+        if not self._authorized(event.sender_id) or not getattr(event, "is_private", False):
+            self.log.warning("忽略未授权或非私聊消息")
             return
 
         text = (event.raw_text or "").strip()
@@ -162,277 +177,6 @@ class TransferService:
             f"大小：{format_bytes(file_size)}\n"
             "状态：在排队\n"
             "无需重新转发，系统会自动处理。"
-        )
-
-    async def _handle_command(
-        self, event: events.NewMessage.Event, text: str
-    ) -> None:
-        parts = text.split()
-        command = parts[0].split("@", 1)[0].lower()
-        if command in {"/start", "/help"}:
-            await event.reply(
-                "把视频或文件直接转发给我即可。\n\n"
-                "/queue - 查看最近任务\n"
-                "/status - 查看系统状态\n"
-                "/task <编号> - 查看单个任务\n"
-                "/confirm <编号> - 在 115 官方客户端确认文件\n"
-                "/retry <编号> - 重试保留的失败任务\n"
-                "/cancel <编号> - 取消任务"
-            )
-        elif command == "/queue":
-            tasks = self.db.list_recent(15)
-            if not tasks:
-                await event.reply("当前没有任务。")
-            else:
-                await event.reply(
-                    "最近任务：\n\n"
-                    + "\n\n".join(self._format_task(task) for task in tasks)
-                )
-        elif command in {"/status", "/performance"}:
-            await event.reply(self._format_status())
-        elif command == "/task":
-            await self._command_task(event, parts)
-        elif command == "/confirm":
-            await self._command_confirm(event, parts)
-        elif command == "/retry":
-            await self._command_retry(event, parts)
-        elif command == "/cancel":
-            await self._command_cancel(event, parts)
-        else:
-            await event.reply("未知命令。发送 /help 查看可用命令。")
-
-    @staticmethod
-    def _parse_task_id(parts: list[str]) -> int | None:
-        if len(parts) != 2:
-            return None
-        try:
-            return int(parts[1].lstrip("#"))
-        except ValueError:
-            return None
-
-    async def _command_task(
-        self, event: events.NewMessage.Event, parts: list[str]
-    ) -> None:
-        task_id = self._parse_task_id(parts)
-        task = self.db.get(task_id) if task_id else None
-        if task is None:
-            await event.reply("用法：/task <任务编号>")
-            return
-        await event.reply(self._format_task(task, verbose=True))
-
-    async def _command_confirm(
-        self, event: events.NewMessage.Event, parts: list[str]
-    ) -> None:
-        task_id = self._parse_task_id(parts)
-        if task_id is None:
-            await event.reply(
-                "用法：/confirm <任务编号>\n"
-                "只在 115 官方客户端看到文件大小正常、可以打开或播放后使用。"
-            )
-            return
-        result, task = self.db.confirm_115(task_id)
-        if result == "missing" or task is None:
-            await event.reply("没有找到这个任务。用法：/confirm <任务编号>")
-            return
-        if result == "already":
-            await event.reply(f"任务 #{task_id} 已经由你确认过。")
-            return
-        if result == "invalid":
-            await event.reply(
-                f"任务当前状态为“{state_label(task['state'])}”，还不能确认。\n"
-                "必须先等 Bot 传输完成，并在 115 官方客户端看到完整文件。"
-            )
-            return
-        await event.reply(
-            f"✅ 任务 #{task_id} 已标记为“115 官方端已由你确认”。\n"
-            "这是你的人工确认记录；Bot 没有调用 115 官方接口复验文件。"
-        )
-
-    async def _command_retry(
-        self, event: events.NewMessage.Event, parts: list[str]
-    ) -> None:
-        task_id = self._parse_task_id(parts)
-        task = self.db.get(task_id) if task_id else None
-        if task is None:
-            await event.reply("用法：/retry <任务编号>")
-            return
-        state = task["state"]
-        if state in {"upload_failed_retained", "verification_failed_retained"}:
-            local_path = Path(task["local_path"] or "")
-            if not local_path.is_file():
-                self.db.update(
-                    task_id,
-                    state="queued",
-                    local_path=None,
-                    downloaded_bytes=0,
-                    download_retries=0,
-                    upload_retries=0,
-                    error=None,
-                    wait_reason="本地文件已不存在，用户要求重新下载",
-                    next_retry_at=0,
-                )
-                await event.reply(f"任务 #{task_id} 已重新进入下载队列。")
-                return
-            self.db.update(
-                task_id,
-                state="waiting_upload",
-                upload_retries=0,
-                error=None,
-                wait_reason="用户要求重试",
-                next_retry_at=0,
-            )
-            await event.reply(f"任务 #{task_id} 已重新进入上传队列。")
-        elif state == "download_failed":
-            self.db.update(
-                task_id,
-                state="queued",
-                download_retries=0,
-                error=None,
-                wait_reason="用户要求重试",
-                next_retry_at=0,
-            )
-            await event.reply(f"任务 #{task_id} 已重新进入下载队列。")
-        else:
-            await event.reply(
-                f"任务当前状态为“{state_label(state)}”，不需要手动重试。"
-            )
-
-    async def _command_cancel(
-        self, event: events.NewMessage.Event, parts: list[str]
-    ) -> None:
-        task_id = self._parse_task_id(parts)
-        task = self.db.get(task_id) if task_id else None
-        if task is None:
-            await event.reply("用法：/cancel <任务编号>")
-            return
-        if task["state"] in {
-            "completed",
-            "confirmed",
-            "cleanup_pending",
-            "cancelled",
-        }:
-            await event.reply(
-                f"任务已经是“{state_label(task['state'])}”状态。"
-            )
-            return
-        running = self.download_tasks.get(task_id) or self.upload_tasks.get(task_id)
-        if running:
-            running.cancel()
-            await asyncio.gather(running, return_exceptions=True)
-        task = self.db.get(task_id)
-        if task is None:
-            await event.reply("任务记录已经不存在，取消中止。")
-            return
-        if task["state"] in {
-            "completed",
-            "confirmed",
-            "cleanup_pending",
-            "cancelled",
-        }:
-            await event.reply(
-                f"任务已经是“{state_label(task['state'])}”状态。"
-            )
-            return
-        remote_path = str(task.get("remote_path") or "")
-        if remote_path:
-            try:
-                if await self.rclone.exists(remote_path):
-                    await self.rclone.remove(remote_path)
-                if await self.rclone.exists(remote_path):
-                    raise RuntimeError("远端文件删除后仍然存在")
-            except Exception as exc:  # noqa: BLE001 - fail closed on remote cleanup
-                await event.reply(
-                    "CloudDrive2 远端文件暂时无法安全清理，取消中止；"
-                    f"本地副本已保留：{exc}"
-                )
-                return
-        local_path = Path(task["local_path"]) if task.get("local_path") else None
-        if local_path and local_path.exists():
-            try:
-                local_path.unlink()
-            except OSError as exc:
-                await event.reply(f"无法安全删除本地文件，取消中止：{exc}")
-                return
-        part = self.settings.download_dir / f"{task_id}.part"
-        if part.exists():
-            try:
-                part.unlink()
-            except OSError as exc:
-                await event.reply(f"无法安全删除下载临时文件，取消中止：{exc}")
-                return
-        self.db.update(
-            task_id,
-            state="cancelled",
-            local_path=None,
-            remote_path=None,
-            downloaded_bytes=0,
-            uploaded_bytes=0,
-            error=None,
-            wait_reason=None,
-        )
-        await event.reply(
-            f"任务 #{task_id} 已取消，本地临时文件和本任务远端文件已清理。"
-        )
-
-    def _format_task(self, task: dict[str, Any], verbose: bool = False) -> str:
-        text = (
-            f"#{task['id']}｜{task['file_name']}\n"
-            f"大小：{format_bytes(task['file_size'])}\n"
-            f"状态：{state_label(task['state'])}"
-        )
-        reason = task.get("wait_reason")
-        error = task.get("error")
-        if reason:
-            text += f"\n等待原因：{reason}"
-        if error:
-            text += f"\n错误：{str(error)[:500]}"
-        if task.get("transfer_mode") == "stream":
-            text += "\n模式：流式传输（不占用本地任务额度）"
-        if verbose:
-            text += (
-                f"\n已下载：{format_bytes(task['downloaded_bytes'])}"
-                f"\n下载重试：{task['download_retries']}"
-                f"\n上传重试：{task['upload_retries']}"
-            )
-            if task.get("remote_path"):
-                text += f"\nCloudDrive2 路径：{task['remote_path']}"
-            if task["state"] == "completed":
-                text += (
-                    "\n115 核验：Bot 无法自动判断；在官方客户端确认后，"
-                    f"发送 /confirm #{task['id']}"
-                )
-            elif task["state"] == "confirmed":
-                text += "\n115 核验：已由你在官方客户端人工确认"
-        return text
-
-    def _format_status(self) -> str:
-        counts = self.db.counts()
-        counts_text = "、".join(
-            f"{state_label(state)} {count}"
-            for state, count in sorted(counts.items())
-        ) or "无"
-        used = self.db.used_local_bytes()
-        snapshot = self.snapshot
-        resource_text = "资源采样尚未完成"
-        if snapshot:
-            resource_text = (
-                f"CPU 平均：{snapshot.cpu_percent:.1f}%\n"
-                f"可用内存：{format_bytes(snapshot.memory_available)}\n"
-                f"磁盘可用：{format_bytes(snapshot.disk_free)}\n"
-                f"网络总速率：{format_bytes(snapshot.network_bytes_per_second)}/s"
-            )
-        return (
-            "系统状态\n"
-            "CloudDrive2 WebDAV："
-            f"{'可写' if self.destination_healthy else '不可用或未配置完成'}\n"
-            "115 官方端：Bot 不自动判断；看到完整文件后使用 /confirm <编号>\n"
-            f"Bot 当前实际传输：下载/流式 {len(self.download_tasks)}，"
-            f"落盘后上传 {len(self.upload_tasks)}\n"
-            f"下载动态窗口：{self.download_window.value}\n"
-            f"上传动态窗口：{self.upload_window.value}\n"
-            f"本地额度：{format_bytes(used)} / {format_bytes(self.settings.local_budget_bytes)}\n"
-            f"{resource_text}\n"
-            f"任务统计：{counts_text}"
         )
 
     def _errors_in_last_minute(self, errors: deque[float]) -> int:
@@ -480,13 +224,6 @@ class TransferService:
             try:
                 self.snapshot = self.monitor.sample()
                 await self._enforce_disk_emergency()
-                now = time.time()
-                if (
-                    now - self.destination_last_checked
-                    >= self.settings.remote_health_interval
-                ):
-                    self.destination_healthy = await self.rclone.healthy()
-                    self.destination_last_checked = now
                 counts = self.db.counts()
                 download_demand = bool(
                     self.download_tasks
@@ -503,33 +240,89 @@ class TransferService:
                     or counts.get("uploading")
                     or counts.get("verifying")
                     or counts.get("finalizing")
+                    or self._stream_count()
                 )
                 self.download_window.update(
                     self.snapshot,
                     recent_errors=self._errors_in_last_minute(
                         self.recent_download_errors
                     ),
-                    destination_healthy=self.destination_healthy,
+                    destination_healthy=self._destination_ready(),
                     demand_present=download_demand,
+                    throughput=self._stage_rate("download") + self._stage_rate("stream"),
+                    active_count=len(self.download_tasks),
+                    backlog_pressure=self.db.used_local_bytes() >= self.settings.local_budget_bytes * 0.8,
                 )
                 self.upload_window.update(
                     self.snapshot,
                     recent_errors=self._errors_in_last_minute(
                         self.recent_upload_errors
                     ),
-                    destination_healthy=self.destination_healthy,
+                    destination_healthy=self._destination_ready(),
                     demand_present=upload_demand,
+                    throughput=self._stage_rate("upload") + self._stage_rate("stream"),
+                    active_count=len(self.upload_tasks) + self._stream_count(),
                 )
-                (self.settings.data_dir / "heartbeat").touch()
+                (self.settings.data_dir / "resource-heartbeat").touch()
             except Exception:
+                self.snapshot = None
                 self.log.exception("资源控制循环异常")
             await asyncio.sleep(self.settings.control_interval)
+
+    async def _destination_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                probe_method = getattr(self.rclone, "probe", None)
+                if callable(probe_method):
+                    probe = await asyncio.wait_for(probe_method(), 30)
+                else:
+                    accessible = await asyncio.wait_for(self.rclone.healthy(), 30)
+                    probe = DestinationProbe(
+                        accessible,
+                        "unknown",
+                        "目录探测通过，不代表可写"
+                        if accessible else "目录访问失败，请核对凭据与网络",
+                    )
+                self.destination_healthy = probe.accessible
+                self.destination_scope = probe.scope
+                self.destination_error = probe.detail
+            except TimeoutError:
+                self.destination_healthy = False
+                self.destination_scope = "unknown"
+                self.destination_error = "目录探测超时"
+            except Exception:
+                self.destination_healthy = False
+                self.destination_scope = "unknown"
+                self.destination_error = "目录探测异常，请查看本机最近日志"
+                self.log.exception("目的端探测异常")
+            self.destination_last_checked = time.time()
+            await asyncio.sleep(self.settings.remote_health_interval)
+
+    async def _watch_loop(self) -> None:
+        while not self._stop.is_set():
+            for task_id, message in list(self._watch_messages.items()):
+                task = self.db.get(task_id)
+                if task is None:
+                    self._watch_messages.pop(task_id, None)
+                    continue
+                text = self._format_task(task, verbose=True)
+                try:
+                    if text != getattr(message, "raw_text", None):
+                        await asyncio.wait_for(message.edit(text), timeout=5)
+                except Exception:  # noqa: BLE001 - Telegram progress is best-effort
+                    self._watch_messages.pop(task_id, None)
+                    self.log.warning("进度订阅更新失败，已停止订阅 #%s", task_id)
+                if task["state"] in {*FAILED_STATES, "completed", "confirmed", "cancelled"}:
+                    self._watch_messages.pop(task_id, None)
+            await asyncio.sleep(5)
 
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                await self._start_downloads()
+                # Drain retained files first; streaming also consumes upload slots.
                 await self._start_uploads()
+                await self._start_downloads()
+                (self.settings.data_dir / "heartbeat").touch()
             except Exception:
                 self.log.exception("调度循环异常")
             await asyncio.sleep(1)
@@ -549,17 +342,27 @@ class TransferService:
             after_id = int(batch[-1]["id"])
 
     async def _start_downloads(self) -> None:
-        if not self.snapshot or not self.destination_healthy:
+        if not self.destination_healthy or not self._sample_fresh() or not self._destination_ready():
+            return
+        if self.db.is_paused():
             return
         available_slots = self.download_window.value - len(self.download_tasks)
         if available_slots <= 0:
             return
         for batch in self._queued_batches(("queued",)):
+            await asyncio.sleep(0)
+            if not self._sample_fresh() or not self._destination_ready() or self.db.is_paused():
+                return
             for task in batch:
                 if available_slots <= 0:
                     return
                 task_id = int(task["id"])
                 if task_id in self.download_tasks:
+                    continue
+                if ((task.get("transfer_mode") == "stream"
+                     or task["file_size"] > self.settings.local_budget_bytes)
+                        and len(self.upload_tasks) + self._stream_count() >= self.upload_window.value):
+                    self.db.update(task_id, wait_reason="流式任务等待共享上传窗口")
                     continue
                 reserved, reason = self.db.reserve(
                     task_id,
@@ -577,21 +380,29 @@ class TransferService:
                 async_task.add_done_callback(
                     lambda _, tid=task_id: self.download_tasks.pop(tid, None)
                 )
+                async_task.add_done_callback(lambda _, tid=task_id: self._progress.pop(tid, None))
                 available_slots -= 1
 
     async def _start_uploads(self) -> None:
-        if not self.snapshot or not self.destination_healthy:
+        if not self.destination_healthy or not self._sample_fresh() or not self._destination_ready():
             return
-        available_slots = self.upload_window.value - len(self.upload_tasks)
+        available_slots = self.upload_window.value - len(self.upload_tasks) - self._stream_count()
         if available_slots <= 0:
             return
-        for batch in self._queued_batches(
-            ("cleanup_pending", "waiting_upload", "downloaded")
-        ):
+        states = ("cleanup_pending",) if self.db.is_paused() else ("cleanup_pending", "waiting_upload", "downloaded")
+        for batch in self._queued_batches(states):
+            await asyncio.sleep(0)
+            if not self._sample_fresh() or not self._destination_ready():
+                return
             for task in batch:
                 if available_slots <= 0:
                     return
                 task_id = int(task["id"])
+                current = self.db.get(task_id)
+                if not current or current.get("cancel_requested") or current["state"] not in states:
+                    continue
+                if self.db.is_paused() and task["state"] != "cleanup_pending":
+                    continue
                 if task_id in self.upload_tasks:
                     continue
                 async_task = asyncio.create_task(
@@ -601,6 +412,7 @@ class TransferService:
                 async_task.add_done_callback(
                     lambda _, tid=task_id: self.upload_tasks.pop(tid, None)
                 )
+                async_task.add_done_callback(lambda _, tid=task_id: self._progress.pop(tid, None))
                 available_slots -= 1
 
     async def _download_one(self, task_id: int) -> None:
@@ -620,15 +432,16 @@ class TransferService:
             now = time.monotonic()
             if now - last_progress_at >= 1 or received >= total:
                 self.db.update(task_id, downloaded_bytes=int(received))
+                self._record_progress(task_id, "download", int(received))
                 last_progress_at = now
 
         try:
             for attempt in range(
                 int(task["download_retries"]), self.settings.max_retries
             ):
-                self.db.update(
+                self.db.transition(
                     task_id,
-                    state="downloading",
+                    "downloading",
                     downloaded_bytes=0,
                     download_retries=attempt,
                     local_path=str(part_path),
@@ -638,12 +451,12 @@ class TransferService:
                 if part_path.exists():
                     part_path.unlink()
                 try:
-                    message = await self.client.get_messages(
+                    message = await self.source.get_messages(
                         int(task["chat_id"]), ids=int(task["message_id"])
                     )
                     if not message or not message.media:
                         raise RuntimeError("Telegram 消息或文件已经不可访问")
-                    result = await self.client.download_media(
+                    result = await self.source.download_media(
                         message, file=str(part_path), progress_callback=progress
                     )
                     if not result or not part_path.is_file():
@@ -655,16 +468,16 @@ class TransferService:
                         )
                     # Persist the final path before the atomic rename. A crash
                     # after the rename can then recover the completed file.
-                    self.db.update(
+                    self.db.transition(
                         task_id,
-                        state="downloaded",
+                        "downloaded",
                         local_path=str(final_path),
                         downloaded_bytes=actual_size,
                     )
                     os.replace(part_path, final_path)
-                    self.db.update(
+                    self.db.transition(
                         task_id,
-                        state="waiting_upload",
+                        "waiting_upload",
                         local_path=str(final_path),
                         downloaded_bytes=actual_size,
                         download_retries=attempt,
@@ -693,9 +506,9 @@ class TransferService:
                         await asyncio.sleep(min(60, 2 ** (attempt + 1)))
             if part_path.exists():
                 part_path.unlink()
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="download_failed",
+                "download_failed",
                 local_path=None,
                 error="下载重试次数已经用完",
                 wait_reason=None,
@@ -705,19 +518,22 @@ class TransferService:
                 "不完整文件已清理，可使用 /retry 重新排队。"
             )
         except asyncio.CancelledError:
-            if part_path.exists():
-                part_path.unlink()
             current = self.db.get(task_id)
-            if current and current["state"] != "cancelled":
-                self.db.update(task_id, state="queued", local_path=None)
+            if current and current["state"] not in {"cancelled", "completed", "confirmed", "cleanup_pending"}:
+                if final_path.is_file() and final_path.stat().st_size == int(task["file_size"]):
+                    self.db.transition(task_id, "waiting_upload", local_path=str(final_path))
+                else:
+                    if not current.get("cancel_requested") and part_path.exists():
+                        part_path.unlink()
+                    self.db.transition(task_id, "queued", local_path=None, downloaded_bytes=0)
             raise
         except Exception as exc:
             self.log.exception("任务 #%s 下载发生未处理异常", task_id)
             if part_path.exists():
                 part_path.unlink()
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="download_failed",
+                "download_failed",
                 local_path=None,
                 error=str(exc)[:1000],
             )
@@ -728,15 +544,23 @@ class TransferService:
         task: dict[str, Any],
         remote_path: str,
         safe_name: str,
+        local_path: Path | None = None,
     ) -> None:
         final_remote = remote_path
         if remote_path.startswith(".uploading-"):
             async with self._finalize_lock:
-                final_remote = await self._choose_remote_final(safe_name, task_id)
-                self.db.update(
+                current = self.db.get(task_id) or task
+                final_remote = str(current.get("remote_final_path") or "")
+                if not final_remote:
+                    final_remote = await self._choose_remote_final(safe_name, task_id)
+                elif await self.rclone.exists(final_remote):
+                    raise RuntimeError("预留正式路径已经存在；保留数据，等待复核")
+                self.db.transition(
                     task_id,
-                    state="finalizing",
+                    "finalizing",
                     remote_path=final_remote,
+                    remote_temp_path=remote_path,
+                    remote_final_path=final_remote,
                 )
                 await self.rclone.move(remote_path, final_remote)
         final_size = await self.rclone.remote_size(final_remote)
@@ -746,8 +570,32 @@ class TransferService:
                 f"流式改名后远端大小错误：{final_size} != {task['file_size']}"
             )
         await self._complete_cloud_receive(
-            task_id, task, None, final_remote
+            task_id, task, local_path, final_remote
         )
+
+    async def _resume_remote(
+        self, task_id: int, task: dict[str, Any], local_path: Path | None,
+        safe_name: str,
+    ) -> bool:
+        current = self.db.get(task_id) or task
+        legacy = str(current.get("remote_path") or "")
+        final = str(current.get("remote_final_path") or
+                    (legacy if legacy and not legacy.startswith(".uploading-") else ""))
+        temp = str(current.get("remote_temp_path") or
+                   (legacy if legacy.startswith(".uploading-") else ""))
+        if final and await self.rclone.exists(final):
+            if await self.rclone.remote_size(final) != int(task["file_size"]):
+                raise RuntimeError("记录的正式文件大小不符；停止覆盖并保留本地数据")
+            await self._complete_cloud_receive(task_id, task, local_path, final)
+            return True
+        if temp and await self.rclone.exists(temp):
+            if await self.rclone.remote_size(temp) == int(task["file_size"]):
+                await self._finalize_stream_remote(task_id, task, temp, safe_name, local_path)
+                return True
+            await self.rclone.remove(temp)
+            if await self.rclone.exists(temp):
+                raise RuntimeError("不完整远端临时文件无法清理；停止重传")
+        return False
 
     async def _stream_one(self, task_id: int) -> None:
         task = self.db.get(task_id)
@@ -761,33 +609,22 @@ class TransferService:
                 int(task["download_retries"]), self.settings.max_retries
             ):
                 try:
-                    current = self.db.get(task_id) or task
-                    recorded_remote = str(current.get("remote_path") or "")
-                    if recorded_remote and await self.rclone.exists(recorded_remote):
-                        recorded_size = await self.rclone.remote_size(recorded_remote)
-                        if recorded_size == int(task["file_size"]):
-                            await self._finalize_stream_remote(
-                                task_id,
-                                task,
-                                recorded_remote,
-                                safe_name,
-                            )
-                            return
-                        if recorded_remote.startswith(".uploading-"):
-                            await self.rclone.remove(recorded_remote)
-                    self.db.update(
+                    if await self._resume_remote(task_id, task, None, safe_name):
+                        return
+                    self.db.transition(
                         task_id,
-                        state="streaming",
+                        "streaming",
                         transfer_mode="stream",
                         local_path=None,
                         remote_path=remote_temp,
+                        remote_temp_path=remote_temp,
                         downloaded_bytes=0,
                         uploaded_bytes=0,
                         download_retries=attempt,
                         error=None,
                         wait_reason=None,
                     )
-                    message = await self.client.get_messages(
+                    message = await self.source.get_messages(
                         int(task["chat_id"]), ids=int(task["message_id"])
                     )
                     if not message or not message.media:
@@ -806,9 +643,10 @@ class TransferService:
                                 downloaded_bytes=int(received),
                                 uploaded_bytes=int(received),
                             )
+                            self._record_progress(task_id, "stream", int(received))
                             last_progress_at = now
 
-                    await self.client.download_media(
+                    await self.source.download_media(
                         message,
                         file=stream,
                         progress_callback=progress,
@@ -820,7 +658,7 @@ class TransferService:
                             f"!= {task['file_size']}"
                         )
                     await stream.finish()
-                    self.db.update(task_id, state="verifying")
+                    self.db.transition(task_id, "verifying")
                     remote_size = await self.rclone.remote_size(remote_temp)
                     if remote_size != int(task["file_size"]):
                         raise RuntimeError(
@@ -839,6 +677,7 @@ class TransferService:
                         stream = None
                     await self.rclone.remove(remote_temp)
                     self.recent_download_errors.append(time.time())
+                    self.recent_upload_errors.append(time.time())
                     self.log.warning(
                         "任务 #%s 流式传输第 %s 次失败：%s",
                         task_id,
@@ -854,11 +693,9 @@ class TransferService:
                         await asyncio.sleep(min(120, 3 ** (attempt + 1)))
             current = self.db.get(task_id) or task
             retained_remote = str(current.get("remote_path") or "")
-            if retained_remote.startswith(".uploading-"):
-                retained_remote = ""
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="download_failed",
+                "download_failed",
                 local_path=None,
                 remote_path=retained_remote or None,
                 error="流式传输重试次数已经用完；使用 /retry 可重新开始",
@@ -875,13 +712,10 @@ class TransferService:
             recorded_remote = (
                 str(current.get("remote_path") or "") if current else ""
             )
-            if recorded_remote.startswith(".uploading-"):
-                await self.rclone.remove(recorded_remote)
-                recorded_remote = ""
-            if current and current["state"] != "cancelled":
-                self.db.update(
+            if current and current["state"] not in {"cancelled", "cleanup_pending", "completed", "confirmed"}:
+                self.db.transition(
                     task_id,
-                    state="queued",
+                    "queued",
                     local_path=None,
                     remote_path=recorded_remote or None,
                     downloaded_bytes=0,
@@ -891,20 +725,24 @@ class TransferService:
             raise
         except Exception as exc:
             self.log.exception("任务 #%s 流式传输发生未处理异常", task_id)
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="download_failed",
+                "download_failed",
                 local_path=None,
                 error=str(exc)[:1000],
             )
 
     async def _choose_remote_final(self, file_name: str, task_id: int) -> str:
-        if not await self.rclone.exists(file_name):
+        def claimed(path: str) -> bool:
+            check = getattr(getattr(self, "db", None), "remote_claimed", None)
+            return bool(check and check(path, task_id))
+
+        if not claimed(file_name) and not await self.rclone.exists(file_name):
             return file_name
         path = Path(file_name)
         candidate = f"{path.stem} (task-{task_id}){path.suffix}"
         suffix = 2
-        while await self.rclone.exists(candidate):
+        while claimed(candidate) or await self.rclone.exists(candidate):
             candidate = f"{path.stem} (task-{task_id}-{suffix}){path.suffix}"
             suffix += 1
         return candidate
@@ -916,13 +754,21 @@ class TransferService:
         local_path: Path | None,
         final_remote: str,
     ) -> None:
+        current = self.db.get(task_id) or task
+        temp = str(current.get("remote_temp_path") or "")
+        if temp and temp != final_remote and await self.rclone.exists(temp):
+            await self.rclone.remove(temp)
+            if await self.rclone.exists(temp):
+                raise RuntimeError("改名后临时文件仍存在；保留本地副本等待安全清理")
         # Persist the verified remote result before deleting the local copy.
         # A restart between these operations can then resume cleanup without
         # re-uploading or creating a duplicate remote file.
-        self.db.update(
+        self.db.transition(
             task_id,
-            state="cleanup_pending",
+            "cleanup_pending",
             remote_path=final_remote,
+            remote_final_path=final_remote,
+            remote_temp_path=None,
             uploaded_bytes=int(task["file_size"]),
             error=None,
             wait_reason="远端文件已校验，正在清理 VPS 本地副本",
@@ -940,9 +786,9 @@ class TransferService:
                 )
                 self.log.warning("任务 #%s 的本地副本清理失败：%s", task_id, exc)
                 return
-        self.db.update(
+        self.db.transition(
             task_id,
-            state="completed",
+            "completed",
             local_path=None,
             error=None,
             wait_reason=None,
@@ -954,18 +800,25 @@ class TransferService:
             f"文件：{task['file_name']}\n"
             f"CloudDrive2 路径：{final_remote}\n"
             "这不代表 Bot 已自动验证 115 官方端。\n"
-            "在 115 官方客户端看到文件大小正常且可以打开或播放后，"
-            f"发送 /confirm #{task_id}。"
+            "人工确认记录不是必需操作；集中核验后可发送一次 /confirm all。"
         )
 
     async def _upload_one(self, task_id: int) -> None:
         task = self.db.get(task_id)
-        if not task:
+        if not task or task.get("cancel_requested") or task.get("state") in {"completed", "confirmed", "cancelled"}:
             return
         local_path = Path(task["local_path"]) if task.get("local_path") else None
         if task.get("state") == "cleanup_pending":
             recorded_remote = str(task.get("remote_path") or "")
             try:
+                if (recorded_remote and await self.rclone.exists(recorded_remote)
+                        and await self.rclone.remote_size(recorded_remote) != int(task["file_size"])):
+                    self.db.transition(
+                        task_id, "verification_failed_retained",
+                        error="已接收的正式文件大小发生变化；停止自动操作，保留路径和本地副本",
+                        wait_reason=None,
+                    )
+                    return
                 if (
                     recorded_remote
                     and await self.rclone.exists(recorded_remote)
@@ -986,9 +839,9 @@ class TransferService:
                 return
             if local_path is None or not local_path.is_file():
                 if task.get("transfer_mode") == "stream":
-                    self.db.update(
+                    self.db.transition(
                         task_id,
-                        state="queued",
+                        "queued",
                         local_path=None,
                         downloaded_bytes=0,
                         uploaded_bytes=0,
@@ -998,26 +851,27 @@ class TransferService:
                         next_retry_at=0,
                     )
                     return
-                self.db.update(
+                self.db.transition(
                     task_id,
-                    state="verification_failed_retained",
+                    "verification_failed_retained",
                     error="远端正式文件和 VPS 本地副本都无法确认，已停止自动操作",
                     wait_reason=None,
                 )
                 return
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="waiting_upload",
+                "waiting_upload",
                 remote_path=None,
+                remote_final_path=None,
                 error="远端正式文件不存在，保留本地副本并重新上传",
                 wait_reason=None,
                 next_retry_at=0,
             )
             task = self.db.get(task_id) or task
         if local_path is None or not local_path.is_file():
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="queued",
+                "queued",
                 local_path=None,
                 downloaded_bytes=0,
                 download_retries=0,
@@ -1035,15 +889,15 @@ class TransferService:
             try:
                 local_path.unlink()
             except OSError as exc:
-                self.db.update(
+                self.db.transition(
                     task_id,
-                    state="verification_failed_retained",
+                    "verification_failed_retained",
                     error=f"{error}；且无法清理：{exc}"[:1000],
                 )
                 return
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="queued",
+                "queued",
                 local_path=None,
                 downloaded_bytes=0,
                 download_retries=0,
@@ -1069,49 +923,29 @@ class TransferService:
                     wait_reason=None,
                 )
                 try:
-                    current = self.db.get(task_id) or task
-                    recorded_remote = str(current.get("remote_path") or "")
-                    if (
-                        recorded_remote
-                        and not recorded_remote.startswith(".uploading-")
-                        and await self.rclone.exists(recorded_remote)
-                    ):
-                        recorded_size = await self.rclone.remote_size(recorded_remote)
-                        if recorded_size == int(task["file_size"]):
-                            await self._complete_cloud_receive(
-                                task_id, task, local_path, recorded_remote
-                            )
-                            return
-                    self.db.update(
+                    if await self._resume_remote(task_id, task, local_path, safe_name):
+                        return
+                    self.db.transition(
                         task_id,
-                        state="uploading",
+                        "uploading",
                         remote_path=remote_temp,
+                        remote_temp_path=remote_temp,
                     )
-                    await self.rclone.upload(local_path, remote_temp)
-                    self.db.update(task_id, state="verifying")
+                    self._record_progress(task_id, "upload", 0, 0)
+
+                    def progress(count: int, speed: float) -> None:
+                        self.db.update(task_id, uploaded_bytes=min(count, int(task["file_size"])))
+                        self._record_progress(task_id, "upload", count, speed)
+
+                    await self.rclone.upload(local_path, remote_temp, progress=progress)
+                    self.db.transition(task_id, "verifying")
                     remote_size = await self.rclone.remote_size(remote_temp)
                     if remote_size != int(task["file_size"]):
                         raise RuntimeError(
                             f"远端大小错误：{remote_size} != {task['file_size']}"
                         )
-                    async with self._finalize_lock:
-                        final_remote = await self._choose_remote_final(
-                            safe_name, task_id
-                        )
-                        self.db.update(
-                            task_id,
-                            state="finalizing",
-                            remote_path=final_remote,
-                        )
-                        await self.rclone.move(remote_temp, final_remote)
-                    final_size = await self.rclone.remote_size(final_remote)
-                    if final_size != int(task["file_size"]):
-                        await self.rclone.remove(final_remote)
-                        raise RuntimeError(
-                            f"改名后远端大小错误：{final_size} != {task['file_size']}"
-                        )
-                    await self._complete_cloud_receive(
-                        task_id, task, local_path, final_remote
+                    await self._finalize_stream_remote(
+                        task_id, task, remote_temp, safe_name, local_path
                     )
                     return
                 except asyncio.CancelledError:
@@ -1129,9 +963,9 @@ class TransferService:
                     if attempt + 1 < self.settings.max_retries:
                         await asyncio.sleep(min(120, 3 ** (attempt + 1)))
             await self.rclone.remove(remote_temp)
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="upload_failed_retained",
+                "upload_failed_retained",
                 error="上传重试次数已经用完；本地完整文件已保留",
             )
             await self._notify(
@@ -1139,16 +973,15 @@ class TransferService:
                 "修复 CloudDrive2 后使用 /retry 重试。"
             )
         except asyncio.CancelledError:
-            await self.rclone.remove(remote_temp)
             current = self.db.get(task_id)
-            if current and current["state"] != "cancelled":
-                self.db.update(task_id, state="waiting_upload")
+            if current and current["state"] not in {"cancelled", "cleanup_pending", "completed", "confirmed"}:
+                self.db.transition(task_id, "waiting_upload")
             raise
         except Exception as exc:
             self.log.exception("任务 #%s 上传发生未处理异常", task_id)
-            self.db.update(
+            self.db.transition(
                 task_id,
-                state="upload_failed_retained",
+                "upload_failed_retained",
                 error=str(exc)[:1000],
             )
 
@@ -1166,9 +999,10 @@ class TransferService:
         self.log.info("Telegram Bot 已登录：@%s", me.username)
         self._background = [
             asyncio.create_task(self._resource_loop(), name="resource-loop"),
+            asyncio.create_task(self._destination_loop(), name="destination-loop"),
             asyncio.create_task(self._scheduler_loop(), name="scheduler-loop"),
+            asyncio.create_task(self._watch_loop(), name="watch-loop"),
         ]
-        (self.settings.data_dir / "heartbeat").touch()
         await self._notify("🤖 Telegram → 115 服务已启动。发送 /status 查看状态。")
 
     async def stop(self) -> None:

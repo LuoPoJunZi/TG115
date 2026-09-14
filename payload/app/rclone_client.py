@@ -4,13 +4,52 @@ import asyncio
 import json
 import logging
 import os
+import re
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import Settings
+from .interfaces import DestinationProbe
 
 
 class RcloneError(RuntimeError):
     pass
+
+
+def parse_progress(line: bytes) -> tuple[int, float] | None:
+    try:
+        stats = json.loads(line).get("stats", {})
+        if "bytes" in stats:
+            active = stats.get("transferring") or []
+            item = active[0] if active else stats
+            count, speed = int(item.get("bytes", stats["bytes"])), float(item.get("speed", 0))
+            if count >= 0 and 0 <= speed < float("inf"):
+                return count, speed
+    except (ValueError, TypeError, AttributeError, KeyError, IndexError):
+        pass
+    return None
+
+
+async def _read_progress_tail(
+    stream: asyncio.StreamReader | None, progress: Callable[[int, float], None],
+) -> str:
+    if stream is None:
+        return ""
+    tail = bytearray()
+    pending = bytearray()
+    while chunk := await stream.read(8192):
+        tail.extend(chunk)
+        del tail[:-65536]
+        pending.extend(chunk)
+        while b"\n" in pending:
+            line, _, rest = pending.partition(b"\n")
+            pending = bytearray(rest)
+            parsed = parse_progress(line)
+            if parsed is not None:
+                progress(*parsed)
+        if len(pending) > 65536:
+            pending.clear()
+    return tail.decode("utf-8", errors="replace").strip()
 
 
 async def _read_process_tail(
@@ -112,6 +151,7 @@ class RcloneClient:
         *args: str,
         timeout: float | None = None,
         check: bool = True,
+        progress: Callable[[int, float], None] | None = None,
     ) -> tuple[int, str, str]:
         command = [
             "rclone",
@@ -125,10 +165,17 @@ class RcloneClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        readers: list[asyncio.Task[str]] = []
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
-            )
+            if progress is None:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+                out = stdout.decode("utf-8", errors="replace").strip()
+                err = stderr.decode("utf-8", errors="replace").strip()
+            else:
+                readers = [asyncio.create_task(_read_process_tail(process.stdout)),
+                           asyncio.create_task(_read_progress_tail(process.stderr, progress))]
+                result = await asyncio.wait_for(asyncio.gather(process.wait(), *readers), timeout=timeout)
+                out, err = result[1], result[2]
         except asyncio.CancelledError:
             try:
                 process.terminate()
@@ -144,11 +191,22 @@ class RcloneClient:
                 await process.wait()
             raise
         except TimeoutError as exc:
-            process.kill()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
             await process.wait()
             raise RcloneError(f"rclone 超时：{' '.join(args[:2])}") from exc
-        out = stdout.decode("utf-8", errors="replace").strip()
-        err = stderr.decode("utf-8", errors="replace").strip()
+        finally:
+            if readers:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+                await asyncio.gather(*readers, return_exceptions=True)
         if check and process.returncode != 0:
             raise RcloneError(
                 f"rclone 退出码 {process.returncode}：{err or out or '未知错误'}"
@@ -221,15 +279,64 @@ class RcloneClient:
         await self._run("mkdir", self.remote(), timeout=45)
         await self._run("lsd", self.remote(), "--max-depth", "1", timeout=45)
 
-    async def healthy(self) -> bool:
+    async def probe(self) -> DestinationProbe:
         try:
-            await self.prepare_destination()
-            return True
+            await self.ensure_config()
+            code, _, _ = await self._run(
+                "lsd", self.remote(), "--max-depth", "1", timeout=20, check=False,
+            )
+            if code in {3, 4} and self.settings.cd2_target:
+                # A not-yet-created target is prepared only by an explicit upload/verify.
+                root_code, _, _ = await self._run(
+                    "lsd", "cd2:", "--max-depth", "1", timeout=20, check=False,
+                )
+                if root_code == 0:
+                    return DestinationProbe(
+                        True, "root_fallback", "WebDAV 根目录可访问；配置的目标目录尚未创建，不代表可写",
+                    )
+                return DestinationProbe(
+                    False, "root_fallback", f"WebDAV 根目录访问失败（退出码 {root_code}）"
+                )
+            if code != 0:
+                return DestinationProbe(False, "target", f"目标目录访问失败（退出码 {code}）")
+            scope = "target" if self.settings.cd2_target else "root"
+            label = "目标目录" if scope == "target" else "WebDAV 根目录"
+            return DestinationProbe(True, scope, f"{label}可访问；只读探测不代表可写")
         except Exception as exc:  # noqa: BLE001 - health boundary for external CLI
             self.log.warning("CloudDrive2/115 健康检查失败：%s", exc)
-            return False
+            return DestinationProbe(False, "unknown", "目录探测异常；请查看 VPS 最近日志")
 
-    async def upload(self, local_path: Path, remote_temp: str) -> None:
+    async def healthy(self) -> bool:
+        return (await self.probe()).accessible
+
+    async def list_staging_objects(self) -> list[tuple[int, str]]:
+        """Read top-level TG115 staging objects without deleting anything."""
+        await self.ensure_config()
+        _, out, _ = await self._run(
+            "lsjson", self.remote(), "--files-only", "--max-depth", "1", timeout=45,
+        )
+        try:
+            payload = json.loads(out)
+            if not isinstance(payload, list):
+                raise TypeError("lsjson result is not a list")
+            result: list[tuple[int, str]] = []
+            pattern = re.compile(r"\.uploading-(\d+)-.+")
+            for item in payload[:10000]:
+                name = str(item.get("Name", "")) if isinstance(item, dict) else ""
+                if "/" in name or "\\" in name:
+                    continue
+                matched = pattern.fullmatch(name)
+                if matched:
+                    result.append((int(matched.group(1)), name))
+            return result
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RcloneError("无法解析远端临时文件清单") from exc
+
+    async def upload(
+        self, local_path: Path, remote_temp: str, *,
+        progress: Callable[[int, float], None] | None = None,
+    ) -> None:
+        await self.prepare_destination()
         await self._run(
             "copyto",
             str(local_path),
@@ -247,15 +354,17 @@ class RcloneClient:
             "--timeout",
             "5m",
             "--stats",
-            "15s",
-            "--stats-one-line",
+            "5s",
+            "--stats-log-level", "NOTICE",
+            "--use-json-log",
             timeout=None,
+            progress=progress,
         )
 
     async def open_upload_stream(
         self, remote_temp: str, exact_size: int
     ) -> RcloneUploadStream:
-        await self.ensure_config()
+        await self.prepare_destination()
         command = [
             "rclone",
             "--config",

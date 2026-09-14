@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from collections import deque
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -19,9 +20,11 @@ sys.path.insert(0, str(SOURCE))
 sys.path.insert(0, str(PAYLOAD))
 
 from app import __version__
+from app.backup_database import backup_database
+from app.bot_commands import state_label
 from app.config import Settings
 from app.db import TaskDB
-from app.main import TransferService, safe_file_name, state_label
+from app.main import TransferService, safe_file_name
 from app.rclone_client import RcloneClient, RcloneError
 from app.resources import AdaptiveWindow, ResourceSnapshot
 from app.verify_destination import verify_destination
@@ -31,7 +34,18 @@ from installer import (
     MANAGED_CD2_WEBDAV_URL,
     InstallerApp,
     b64,
+    packaged_self_test,
     re_safe_remote_stage,
+)
+from vps_resources import (
+    GIB,
+    PROBE_BEGIN,
+    PROBE_END,
+    VpsResources,
+    assess_storage_choice,
+    build_probe_command,
+    parse_probe_output,
+    recommend_storage,
 )
 
 
@@ -65,7 +79,71 @@ def valid_installer_values() -> dict[str, str]:
     }
 
 
+def sample_vps_resources(
+    *,
+    total_gb: int = 50,
+    available_gb: int = 42,
+    memory_gb: float = 4,
+    cpu_cores: int = 2,
+    install_present: bool = False,
+    downloads_gb: int = 0,
+    fuse_available: bool = True,
+    inodes_total: int = 1_000_000,
+    inodes_available: int = 900_000,
+    docker_same_filesystem: bool = True,
+    docker_available_gb: int = 42,
+    docker_inodes_total: int = 1_000_000,
+    docker_inodes_available: int = 900_000,
+) -> VpsResources:
+    return VpsResources(
+        architecture="x86_64",
+        cpu_cores=cpu_cores,
+        memory_total_bytes=int(memory_gb * GIB),
+        memory_available_bytes=int(memory_gb * GIB * 0.75),
+        swap_total_bytes=GIB,
+        filesystem_type="ext2/ext3",
+        storage_total_bytes=total_gb * GIB,
+        storage_available_bytes=available_gb * GIB,
+        inodes_total=inodes_total,
+        inodes_available=inodes_available,
+        install_present=install_present,
+        install_used_bytes=downloads_gb * GIB,
+        downloads_used_bytes=downloads_gb * GIB,
+        backups_used_bytes=0,
+        docker_same_filesystem=docker_same_filesystem,
+        docker_root_detected=True,
+        docker_storage_total_bytes=50 * GIB,
+        docker_storage_available_bytes=docker_available_gb * GIB,
+        docker_inodes_total=docker_inodes_total,
+        docker_inodes_available=docker_inodes_available,
+        fuse_available=fuse_available,
+    )
+
+
 class InstallerHelpersTests(unittest.TestCase):
+    def test_packaged_self_test_rejects_broken_tk(self) -> None:
+        import tkinter as tk
+
+        with tempfile.TemporaryDirectory() as temp:
+            result = Path(temp) / "result.txt"
+            with patch("installer.tk.Tk", side_effect=tk.TclError("test-only")):
+                self.assertEqual(packaged_self_test(result), 1)
+            self.assertIn("gui_runtime=FAILED", result.read_text(encoding="utf-8"))
+
+    def test_packaged_self_test_checks_gui_and_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result = Path(temp) / "result.txt"
+            root = Mock()
+            with (
+                patch("installer.tk.Tk", return_value=root),
+                patch("installer.InstallerApp") as app_class,
+            ):
+                self.assertEqual(packaged_self_test(result), 0)
+            root.withdraw.assert_called_once()
+            app_class.assert_called_once_with(root)
+            root.destroy.assert_called_once()
+            self.assertIn("result=OK", result.read_text(encoding="utf-8"))
+
     def test_base64_round_trip(self) -> None:
         value = "p@ss$ word/中文"
         self.assertEqual(base64.b64decode(b64(value)).decode(), value)
@@ -155,6 +233,283 @@ class InstallerHelpersTests(unittest.TestCase):
         app._validate.assert_called_once()
 
 
+class VpsResourceRecommendationTests(unittest.TestCase):
+    @staticmethod
+    def probe_output() -> str:
+        return "\n".join(
+            (
+                "unrelated login banner",
+                PROBE_BEGIN,
+                "PROBE_VERSION=2",
+                "ARCHITECTURE=x86_64",
+                "CPU_CORES=2",
+                "MEMORY_TOTAL_KIB=4194304",
+                "MEMORY_AVAILABLE_KIB=3145728",
+                "SWAP_TOTAL_KIB=1048576",
+                "FILESYSTEM_TYPE=ext2/ext3",
+                f"STORAGE_TOTAL_BYTES={50 * GIB}",
+                f"STORAGE_AVAILABLE_BYTES={42 * GIB}",
+                "INODES_TOTAL=1000000",
+                "INODES_AVAILABLE=900000",
+                "INSTALL_PRESENT=0",
+                "INSTALL_USED_KIB=0",
+                "DOWNLOADS_USED_KIB=0",
+                "BACKUPS_USED_KIB=0",
+                "DOCKER_SAME_FILESYSTEM=1",
+                "DOCKER_ROOT_DETECTED=1",
+                f"DOCKER_STORAGE_TOTAL_BYTES={50 * GIB}",
+                f"DOCKER_STORAGE_AVAILABLE_BYTES={42 * GIB}",
+                "DOCKER_INODES_TOTAL=1000000",
+                "DOCKER_INODES_AVAILABLE=900000",
+                "FUSE_AVAILABLE=1",
+                PROBE_END,
+            )
+        )
+
+    def test_probe_output_is_strictly_parsed_between_markers(self) -> None:
+        resources = parse_probe_output(self.probe_output())
+        self.assertEqual(resources.cpu_cores, 2)
+        self.assertEqual(resources.memory_total_bytes, 4 * GIB)
+        self.assertEqual(resources.storage_available_bytes, 42 * GIB)
+        self.assertEqual(resources.filesystem_type, "ext2/ext3")
+        self.assertTrue(resources.docker_same_filesystem)
+        self.assertTrue(resources.docker_root_detected)
+        self.assertEqual(resources.docker_storage_available_bytes, 42 * GIB)
+
+    def test_installer_probe_uses_current_install_path_and_publishes_advice(self) -> None:
+        app = InstallerApp.__new__(InstallerApp)
+        app._publish_resource_advice = Mock()
+        session = Mock()
+        session.run.side_effect = ((0, "1000\n"), (0, self.probe_output()))
+        values = valid_installer_values()
+        resources, advice = app._probe_and_recommend(session, values)
+        self.assertEqual(resources.cpu_cores, 2)
+        self.assertEqual(advice.preferred_key, "balanced")
+        command = session.run.call_args.args[0]
+        self.assertIn("/opt/tg115", command)
+        self.assertEqual(session.run.call_args_list[0].args, ("id -u",))
+        self.assertEqual(session.run.call_args_list[0].kwargs, {"timeout": 10})
+        self.assertEqual(
+            session.run.call_args_list[1].kwargs,
+            {"sudo": True, "timeout": 30},
+        )
+        app._publish_resource_advice.assert_called_once()
+
+    def test_applying_plan_changes_only_instance_storage_values(self) -> None:
+        class Variable:
+            def __init__(self, value: str):
+                self.value = value
+
+            def get(self) -> str:
+                return self.value
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        app = InstallerApp.__new__(InstallerApp)
+        app.values = {
+            "install_dir": Variable("/opt/tg115"),
+            "deploy_clouddrive2": Variable("true"),
+            "local_budget_gb": Variable("20"),
+            "min_free_disk_gb": Variable("20"),
+        }
+        app.storage_advice = recommend_storage(
+            sample_vps_resources(total_gb=39, available_gb=30, memory_gb=2.4),
+            managed_clouddrive=True,
+        )
+        app.storage_probe_basis = ("/opt/tg115", True)
+        app._log = Mock()
+        app._apply_storage_plan("stream_first")
+        self.assertEqual(app.values["local_budget_gb"].get(), "8")
+        self.assertEqual(app.values["min_free_disk_gb"].get(), "8")
+
+    def test_probe_rejects_missing_or_duplicate_fields(self) -> None:
+        with self.assertRaisesRegex(ValueError, "完整边界"):
+            parse_probe_output("CPU_CORES=2")
+        duplicate = self.probe_output().replace(
+            "CPU_CORES=2", "CPU_CORES=2\nCPU_CORES=4"
+        )
+        with self.assertRaisesRegex(ValueError, "字段重复"):
+            parse_probe_output(duplicate)
+
+    def test_probe_command_accepts_only_safe_install_path(self) -> None:
+        command = build_probe_command("/opt/tg115")
+        self.assertIn(PROBE_BEGIN, command)
+        self.assertIn("df -PB1", command)
+        self.assertIn("timeout 5s du", command)
+        self.assertIn("timeout 5s docker info", command)
+        self.assertIn("/opt/tg115", command)
+        with self.assertRaisesRegex(ValueError, "安装目录"):
+            build_probe_command("/opt/tg115;touch /tmp/pwned")
+
+    def test_small_vps_prefers_stream_first_without_changing_defaults(self) -> None:
+        advice = recommend_storage(
+            sample_vps_resources(total_gb=39, available_gb=30, memory_gb=2.4),
+            managed_clouddrive=True,
+        )
+        self.assertEqual(advice.performance_profile, "保守")
+        self.assertEqual(advice.preferred_key, "stream_first")
+        self.assertEqual(
+            (advice.stream_first.budget_gb, advice.stream_first.reserve_gb),
+            (8, 8),
+        )
+        self.assertTrue(advice.stream_first.safe)
+
+    def test_standard_and_large_vps_prefer_balanced_profile(self) -> None:
+        standard = recommend_storage(
+            sample_vps_resources(), managed_clouddrive=True
+        )
+        self.assertEqual(standard.preferred_key, "balanced")
+        self.assertEqual(
+            (standard.balanced.budget_gb, standard.balanced.reserve_gb),
+            (15, 10),
+        )
+        large = recommend_storage(
+            sample_vps_resources(
+                total_gb=100, available_gb=90, memory_gb=8, cpu_cores=4
+            ),
+            managed_clouddrive=True,
+        )
+        self.assertEqual(large.performance_profile, "批量")
+        self.assertEqual(large.preferred_key, "balanced")
+        self.assertEqual(
+            (large.balanced.budget_gb, large.balanced.reserve_gb),
+            (20, 20),
+        )
+
+    def test_insufficient_disk_has_no_applicable_plan(self) -> None:
+        advice = recommend_storage(
+            sample_vps_resources(total_gb=20, available_gb=10),
+            managed_clouddrive=True,
+        )
+        self.assertIsNone(advice.preferred)
+        self.assertFalse(advice.balanced.safe)
+        self.assertFalse(advice.stream_first.safe)
+
+    def test_deploy_assessment_rejects_unsafe_defaults_and_accepts_advice(self) -> None:
+        resources = sample_vps_resources(
+            total_gb=39, available_gb=30, memory_gb=2.4
+        )
+        unsafe = assess_storage_choice(
+            resources,
+            budget_gb=20,
+            reserve_gb=20,
+            managed_clouddrive=True,
+        )
+        self.assertFalse(unsafe.safe)
+        advice = recommend_storage(resources, managed_clouddrive=True)
+        safe = assess_storage_choice(
+            resources,
+            budget_gb=advice.stream_first.budget_gb,
+            reserve_gb=advice.stream_first.reserve_gb,
+            managed_clouddrive=True,
+        )
+        self.assertTrue(safe.safe)
+
+    def test_existing_downloads_are_not_counted_twice_during_upgrade(self) -> None:
+        resources = sample_vps_resources(
+            total_gb=40,
+            available_gb=20,
+            install_present=True,
+            downloads_gb=15,
+        )
+        advice = recommend_storage(resources, managed_clouddrive=True)
+        self.assertEqual(advice.balanced.budget_gb, 15)
+        self.assertTrue(advice.balanced.safe)
+        assessment = assess_storage_choice(
+            resources,
+            budget_gb=15,
+            reserve_gb=8,
+            managed_clouddrive=True,
+        )
+        self.assertTrue(assessment.safe)
+        self.assertEqual(assessment.required_available_gb, 11)
+
+    def test_managed_clouddrive_requires_memory_fuse_and_inodes(self) -> None:
+        resources_without_fuse = sample_vps_resources(fuse_available=False)
+        advice = recommend_storage(
+            resources_without_fuse, managed_clouddrive=True
+        )
+        self.assertIsNone(advice.preferred)
+        self.assertFalse(advice.balanced.safe)
+        self.assertIn("/dev/fuse", advice.balanced.reason)
+        no_fuse = assess_storage_choice(
+            resources_without_fuse,
+            budget_gb=15,
+            reserve_gb=10,
+            managed_clouddrive=True,
+        )
+        self.assertFalse(no_fuse.safe)
+        self.assertIn("/dev/fuse", no_fuse.reason)
+        low_memory = assess_storage_choice(
+            sample_vps_resources(memory_gb=1.5),
+            budget_gb=4,
+            reserve_gb=8,
+            managed_clouddrive=False,
+        )
+        self.assertFalse(low_memory.safe)
+        low_inodes = assess_storage_choice(
+            sample_vps_resources(inodes_available=100),
+            budget_gb=15,
+            reserve_gb=10,
+            managed_clouddrive=True,
+        )
+        self.assertFalse(low_inodes.safe)
+        self.assertIn("inode", low_inodes.reason)
+
+    def test_deploy_assessment_keeps_remote_installer_eight_gb_floor(self) -> None:
+        assessment = assess_storage_choice(
+            sample_vps_resources(
+                total_gb=20,
+                available_gb=7,
+                install_present=True,
+            ),
+            budget_gb=1,
+            reserve_gb=1,
+            managed_clouddrive=False,
+        )
+        self.assertFalse(assessment.safe)
+        self.assertEqual(assessment.required_available_gb, 8)
+
+    def test_separate_docker_filesystem_is_checked_independently(self) -> None:
+        resources = sample_vps_resources(
+            docker_same_filesystem=False,
+            docker_available_gb=5,
+        )
+        advice = recommend_storage(resources, managed_clouddrive=True)
+        self.assertIsNone(advice.preferred)
+        self.assertIn("Docker 数据文件系统至少需要 6GB", advice.balanced.reason)
+        assessment = assess_storage_choice(
+            resources,
+            budget_gb=15,
+            reserve_gb=10,
+            managed_clouddrive=True,
+        )
+        self.assertFalse(assessment.safe)
+        healthy = sample_vps_resources(
+            docker_same_filesystem=False,
+            docker_available_gb=8,
+        )
+        self.assertTrue(
+            assess_storage_choice(
+                healthy,
+                budget_gb=15,
+                reserve_gb=10,
+                managed_clouddrive=True,
+            ).safe
+        )
+
+    def test_separate_docker_filesystem_inode_pressure_blocks_plan(self) -> None:
+        resources = sample_vps_resources(
+            docker_same_filesystem=False,
+            docker_available_gb=8,
+            docker_inodes_available=100,
+        )
+        advice = recommend_storage(resources, managed_clouddrive=True)
+        self.assertIsNone(advice.preferred)
+        self.assertIn("Docker 数据文件系统可用 inode", advice.balanced.reason)
+
+
 class FileNameSafetyTests(unittest.TestCase):
     def test_long_utf8_name_stays_below_filesystem_byte_limit(self) -> None:
         result = safe_file_name("测试视频" * 80 + ".mp4", "fallback.bin")
@@ -168,7 +523,7 @@ class StatusTextTests(unittest.TestCase):
         self.assertEqual(state_label("queued"), "在排队")
         self.assertEqual(
             state_label("completed"),
-            "Bot 传输已完成，115 官方端待确认",
+            "Bot 传输已完成（CloudDrive2 已接收）",
         )
         self.assertEqual(state_label("confirmed"), "115 官方端已由你确认")
         self.assertNotIn("正在上传", state_label("completed"))
@@ -276,6 +631,17 @@ class DatabaseTests(unittest.TestCase):
         self.assertFalse(created)
         self.assertEqual(first["id"], second["id"])
         self.assertEqual(second["file_size"], 1000)
+
+    def test_online_database_backup_includes_wal_and_passes_integrity_check(self) -> None:
+        task = self.make_task(77, 10)
+        destination = self.root / "backups" / "tg115.db"
+        backup_database(self.db.path, destination)
+        with closing(sqlite3.connect(destination)) as copied:
+            self.assertEqual(copied.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            row = copied.execute(
+                "SELECT file_name FROM tasks WHERE id=?", (task["id"],)
+            ).fetchone()
+            self.assertEqual(row[0], task["file_name"])
 
     def test_same_telegram_media_id_is_not_downloaded_twice(self) -> None:
         first, created = self.db.create_task(
@@ -798,6 +1164,7 @@ class RcloneConfigTests(unittest.TestCase):
         )
         client = RcloneClient(settings)
         client._config_ready = True
+        client.prepare_destination = AsyncMock()
 
         class Stdin:
             def __init__(self) -> None:
@@ -948,6 +1315,9 @@ class UploadRecoveryTests(unittest.TestCase):
         def update(self, _: int, **fields: object) -> None:
             self.task.update(fields)
 
+        def transition(self, _: int, new_state: str, **fields: object) -> None:
+            self.task.update(state=new_state, **fields)
+
     @staticmethod
     def service(task: dict[str, object]) -> TransferService:
         service = TransferService.__new__(TransferService)
@@ -1089,7 +1459,7 @@ class UploadRecoveryTests(unittest.TestCase):
                 def __init__(self) -> None:
                     self.removed: list[str] = []
 
-                async def upload(self, *_: object) -> None:
+                async def upload(self, *_: object, **__: object) -> None:
                     raise RuntimeError("simulated upload failure")
 
                 async def remove(self, remote: str) -> None:
@@ -1105,7 +1475,7 @@ class UploadRecoveryTests(unittest.TestCase):
 
 class PayloadTests(unittest.TestCase):
     def test_windows_and_server_versions_match(self) -> None:
-        self.assertEqual(APP_VERSION, "1.5.0")
+        self.assertEqual(APP_VERSION, "1.6.0")
         self.assertEqual(__version__, APP_VERSION)
 
     def test_required_payload_files_exist(self) -> None:
@@ -1116,7 +1486,13 @@ class PayloadTests(unittest.TestCase):
             "remote_install.sh",
             "repair_clouddrive_network.sh",
             "manage.sh",
+            "backup_retention.sh",
             "app/main.py",
+            "app/bot_commands.py",
+            "app/interfaces.py",
+            "app/states.py",
+            "app/deployment_check.py",
+            "app/backup_database.py",
             "app/db.py",
             "app/naming.py",
             "app/resources.py",
@@ -1182,7 +1558,7 @@ class PayloadTests(unittest.TestCase):
         self.assertIn("socket.create_connection((h,19798),5)", repair)
         self.assertIn("python -m app.verify_destination", repair)
         self.assertIn("TG115_REPAIR=SUCCESS", repair)
-        self.assertIn('rm -rf -- "$INSTALL_DIR/app"', remote_install)
+        self.assertIn("remove_program_files", remote_install)
 
     def test_bot_container_is_non_root_and_restricted(self) -> None:
         compose = (PAYLOAD / "docker-compose.yml").read_text(encoding="utf-8")
@@ -1214,6 +1590,7 @@ class PayloadTests(unittest.TestCase):
             remote_install,
         )
         self.assertIn("安装目录不能包含 . 或 .. 路径段", remote_install)
+        self.assertIn('df -Pk -- "$INSTALL_PROBE_PATH"', remote_install)
 
 
 if __name__ == "__main__":

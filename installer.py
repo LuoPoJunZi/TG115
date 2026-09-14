@@ -24,8 +24,20 @@ from urllib.parse import urlsplit
 
 import paramiko
 
+from vps_resources import (
+    GIB,
+    StorageAdvice,
+    StoragePlan,
+    VpsResources,
+    assess_storage_choice,
+    build_probe_command,
+    parse_probe_output,
+    recommend_storage,
+    validate_install_dir,
+)
+
 APP_TITLE = "Telegram → 115 一键部署器"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 MANAGED_CD2_WEBDAV_URL = "http://clouddrive2:19798/dav"
 
 
@@ -224,6 +236,9 @@ class InstallerApp:
         self.values: dict[str, tk.StringVar] = {}
         self.busy = False
         self.tunnel: Tunnel | None = None
+        self.vps_resources: VpsResources | None = None
+        self.storage_advice: StorageAdvice | None = None
+        self.storage_probe_basis: tuple[str, bool] | None = None
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -414,15 +429,49 @@ class InstallerApp:
         self._entry(tab, 2, "本地任务预算（GB）", "local_budget_gb", "20")
         self._entry(tab, 3, "磁盘最少保留（GB）", "min_free_disk_gb", "20")
         self._entry(tab, 4, "时区", "timezone", "Asia/Shanghai")
+        resource_actions = ttk.Frame(tab)
+        resource_actions.grid(
+            row=5, column=0, columnspan=2, sticky=tk.W, pady=(10, 4)
+        )
+        self.resource_probe_button = ttk.Button(
+            resource_actions,
+            text="检测 VPS 并推荐",
+            command=self.detect_resources,
+        )
+        self.resource_probe_button.pack(side=tk.LEFT)
+        self.apply_balanced_button = ttk.Button(
+            resource_actions,
+            text="应用均衡值",
+            command=lambda: self._apply_storage_plan("balanced"),
+            state=tk.DISABLED,
+        )
+        self.apply_balanced_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.apply_stream_button = ttk.Button(
+            resource_actions,
+            text="应用流式优先值",
+            command=lambda: self._apply_storage_plan("stream_first"),
+            state=tk.DISABLED,
+        )
+        self.apply_stream_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.resource_summary = tk.StringVar(
+            value="尚未检测 VPS；测试 SSH 时也会自动生成实例级建议。"
+        )
+        ttk.Label(
+            tab,
+            textvariable=self.resource_summary,
+            wraplength=800,
+            justify=tk.LEFT,
+            foreground="#333333",
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 4))
         ttk.Label(
             tab,
             text=(
-                "推荐保持 20GB 本地预算和 20GB 磁盘安全线。程序不会写死任务数量，"
-                "而是根据 CPU、内存、磁盘、网络和错误率动态放行；"
+                "源码默认仍为 20GB 本地预算和 20GB 磁盘安全线。检测只提供当前 VPS 的"
+                "实例建议，点击应用后才会改输入框；部署前还会重新检测。"
                 "单文件超过本地预算时自动使用流式模式。"
             ),
             wraplength=800,
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(10, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
 
     def _choose_key(self, entry: ttk.Entry) -> None:
         path = filedialog.askopenfilename(
@@ -506,15 +555,7 @@ class InstallerApp:
             raise ValueError("115 目标路径不能包含控制字符或反斜杠")
         if ".." in target.split("/"):
             raise ValueError("115 目标路径不能包含 ..")
-        if not re.fullmatch(
-            r"/opt/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*",
-            values["install_dir"],
-        ):
-            raise ValueError("安装目录只能是 /opt/ 下不含空格的安全路径")
-        if any(
-            part in {".", ".."} for part in values["install_dir"].split("/")
-        ):
-            raise ValueError("安装目录不能包含 . 或 ..")
+        validate_install_dir(values["install_dir"])
         if not re.fullmatch(r"[A-Za-z0-9_+./-]+", values["timezone"]):
             raise ValueError("时区格式不正确")
         if (
@@ -581,8 +622,24 @@ class InstallerApp:
                 self.cloud_button,
                 self.repair_button,
                 self.verify_button,
+                self.resource_probe_button,
             ):
                 button.configure(state=state)
+            advice = self.storage_advice
+            self.apply_balanced_button.configure(
+                state=(
+                    tk.NORMAL
+                    if not busy and advice and advice.balanced.safe
+                    else tk.DISABLED
+                )
+            )
+            self.apply_stream_button.configure(
+                state=(
+                    tk.NORMAL
+                    if not busy and advice and advice.stream_first.safe
+                    else tk.DISABLED
+                )
+            )
             if busy:
                 self.progress.start(10)
             else:
@@ -634,6 +691,139 @@ class InstallerApp:
         session.connect()
         return session
 
+    @staticmethod
+    def _storage_probe_basis(values: dict[str, str]) -> tuple[str, bool]:
+        return (
+            validate_install_dir(values["install_dir"]),
+            values.get("deploy_clouddrive2", "true") == "true",
+        )
+
+    @staticmethod
+    def _plan_summary(plan: StoragePlan, preferred_key: str | None) -> str:
+        marker = "（推荐）" if plan.key == preferred_key else ""
+        if not plan.safe:
+            return f"{plan.label}{marker}：不可安全应用，{plan.reason}"
+        return (
+            f"{plan.label}{marker}：本地预算 {plan.budget_gb}GB，"
+            f"最少保留 {plan.reserve_gb}GB"
+        )
+
+    def _resource_summary_text(
+        self, resources: VpsResources, advice: StorageAdvice
+    ) -> str:
+        memory_total = resources.memory_total_bytes / GIB
+        memory_available = resources.memory_available_bytes / GIB
+        swap_total = resources.swap_total_bytes / GIB
+        storage_total = resources.storage_total_bytes / GIB
+        storage_available = resources.storage_available_bytes / GIB
+        install_used = resources.install_used_bytes / GIB
+        backups_used = resources.backups_used_bytes / GIB
+        if resources.docker_same_filesystem:
+            docker_storage = "与安装目录位于同一文件系统"
+        else:
+            detected = "Docker 已报告实际目录" if resources.docker_root_detected else "按默认目录估算"
+            docker_available = resources.docker_storage_available_bytes / GIB
+            docker_storage = (
+                f"位于另一文件系统，可用 {docker_available:.1f}GB（{detected}）"
+            )
+        fuse = "可用" if resources.fuse_available else "不可用"
+        return (
+            f"检测结果：{resources.cpu_cores} 核 / 内存 {memory_total:.1f}GB"
+            f"（可用 {memory_available:.1f}GB）/ Swap {swap_total:.1f}GB；"
+            f"存储 {storage_total:.1f}GB（可用 {storage_available:.1f}GB，"
+            f"{resources.filesystem_type}）；当前安装目录占用 {install_used:.1f}GB；"
+            f"历史备份占用 {backups_used:.1f}GB；Docker：{docker_storage}；"
+            f"FUSE：{fuse}；性能档位（仅提示）："
+            f"{advice.performance_profile}。\n"
+            f"{self._plan_summary(advice.balanced, advice.preferred_key)}；"
+            f"{self._plan_summary(advice.stream_first, advice.preferred_key)}。"
+        )
+
+    def _publish_resource_advice(
+        self,
+        resources: VpsResources,
+        advice: StorageAdvice,
+        basis: tuple[str, bool],
+    ) -> None:
+        self.vps_resources = resources
+        self.storage_advice = advice
+        self.storage_probe_basis = basis
+        summary = self._resource_summary_text(resources, advice)
+        self._log(summary)
+
+        def update() -> None:
+            self.resource_summary.set(summary)
+            if not self.busy:
+                self.apply_balanced_button.configure(
+                    state=tk.NORMAL if advice.balanced.safe else tk.DISABLED
+                )
+                self.apply_stream_button.configure(
+                    state=tk.NORMAL if advice.stream_first.safe else tk.DISABLED
+                )
+
+        self.root.after(0, update)
+
+    def _probe_and_recommend(
+        self, session: RemoteSession, values: dict[str, str]
+    ) -> tuple[VpsResources, StorageAdvice]:
+        basis = self._storage_probe_basis(values)
+        uid_code, uid_output = session.run("id -u", timeout=10)
+        uid_lines = [line.strip() for line in uid_output.splitlines() if line.strip()]
+        if uid_code != 0 or not uid_lines or not uid_lines[-1].isdigit():
+            raise RuntimeError("SSH 已连接，但无法确认 VPS 用户权限")
+        code, output = session.run(
+            build_probe_command(basis[0]),
+            sudo=uid_lines[-1] != "0",
+            timeout=30,
+        )
+        if code != 0:
+            raise RuntimeError("SSH 已连接，但无法读取 VPS CPU、内存和目标文件系统")
+        try:
+            resources = parse_probe_output(output)
+        except ValueError as exc:
+            raise RuntimeError(f"VPS 资源探测结果无效：{exc}") from exc
+        advice = recommend_storage(resources, managed_clouddrive=basis[1])
+        self._publish_resource_advice(resources, advice, basis)
+        return resources, advice
+
+    def _apply_storage_plan(self, key: str) -> None:
+        advice = self.storage_advice
+        if advice is None or self.storage_probe_basis is None:
+            messagebox.showwarning("尚未检测", "请先检测 VPS 并生成实例级建议。")
+            return
+        current_basis = self._storage_probe_basis(self._snapshot())
+        if current_basis != self.storage_probe_basis:
+            messagebox.showwarning(
+                "建议已经过期",
+                "安装目录或 CloudDrive2 部署方式已经变化，请重新检测 VPS。",
+            )
+            return
+        plan = advice.balanced if key == "balanced" else advice.stream_first
+        if not plan.safe:
+            messagebox.showwarning("建议不可用", plan.reason)
+            return
+        self.values["local_budget_gb"].set(str(plan.budget_gb))
+        self.values["min_free_disk_gb"].set(str(plan.reserve_gb))
+        self._log(
+            f"已应用{plan.label}：本地任务预算 {plan.budget_gb}GB，"
+            f"磁盘最少保留 {plan.reserve_gb}GB。"
+        )
+
+    def detect_resources(self) -> None:
+        values = self._snapshot()
+
+        def action() -> None:
+            self._validate_connection(values)
+            validate_install_dir(values["install_dir"])
+            self._log("正在读取 VPS CPU、内存和目标文件系统……")
+            session = self._new_session(values)
+            try:
+                self._probe_and_recommend(session, values)
+            finally:
+                session.close()
+
+        self._run_worker(action)
+
     def test_connection(self) -> None:
         values = self._snapshot()
 
@@ -651,6 +841,7 @@ class InstallerApp:
                     raise RuntimeError("SSH 已连接，但预检命令失败")
                 for line in output.splitlines():
                     self._log(line)
+                self._probe_and_recommend(session, values)
                 self._log("SSH 测试成功。")
                 self.root.after(
                     0, lambda: messagebox.showinfo("测试成功", "SSH 连接和基础预检正常。")
@@ -719,6 +910,45 @@ class InstallerApp:
                 # UUID plus mkdir mode 700 prevents cross-user stage reuse.
                 remote_stage = f"/tmp/tg115-deploy-{uuid.uuid4().hex}"  # nosec B108
                 try:
+                    self._log("SSH 连接成功，重新核对 VPS 资源和当前存储配置……")
+                    resources, advice = self._probe_and_recommend(session, values)
+                    if resources.architecture not in {
+                        "x86_64", "amd64", "aarch64", "arm64"
+                    }:
+                        raise RuntimeError(
+                            f"当前 CPU 架构暂不支持：{resources.architecture}"
+                        )
+                    assessment = assess_storage_choice(
+                        resources,
+                        budget_gb=float(values["local_budget_gb"]),
+                        reserve_gb=float(values["min_free_disk_gb"]),
+                        managed_clouddrive=(
+                            values.get("deploy_clouddrive2", "true") == "true"
+                        ),
+                    )
+                    if not assessment.safe:
+                        preferred = advice.preferred
+                        hint = (
+                            f"建议先应用{preferred.label}的 "
+                            f"{preferred.budget_gb}/{preferred.reserve_gb}GB。"
+                            if preferred else "当前 VPS 需要释放空间或扩容后再部署。"
+                        )
+                        raise RuntimeError(
+                            f"部署前资源校验未通过：{assessment.reason}。{hint}"
+                        )
+                    if (
+                        advice.preferred
+                        and float(values["min_free_disk_gb"])
+                        < advice.preferred.reserve_gb
+                    ):
+                        self._log(
+                            "警告：当前磁盘保留线低于实例建议；部署会继续，但应关注 "
+                            "CloudDrive2 缓存和 Docker 空间。"
+                        )
+                    self._log(
+                        f"部署前容量校验通过：预计至少需要 "
+                        f"{assessment.required_available_gb:.1f}GB 可用空间。"
+                    )
                     self._log("SSH 连接成功，上传部署包……")
                     code, _ = session.run(f"mkdir -m 700 {remote_stage}")
                     if code != 0:
@@ -829,15 +1059,7 @@ class InstallerApp:
 
         def action() -> None:
             self._validate_connection(values)
-            if not re.fullmatch(
-                r"/opt/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*",
-                values["install_dir"],
-            ):
-                raise ValueError("安装目录只能是 /opt/ 下不含空格的安全路径")
-            if any(
-                part in {".", ".."} for part in values["install_dir"].split("/")
-            ):
-                raise ValueError("安装目录不能包含 . 或 ..")
+            validate_install_dir(values["install_dir"])
             repair_script = resource_path("payload/repair_clouddrive_network.sh")
             if not repair_script.is_file():
                 raise RuntimeError("部署器内部修复脚本缺失，请重新下载完整安装包")
@@ -906,15 +1128,7 @@ class InstallerApp:
 
         def action() -> None:
             self._validate_connection(values)
-            if not re.fullmatch(
-                r"/opt/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*",
-                values["install_dir"],
-            ):
-                raise ValueError("安装目录只能是 /opt/ 下不含空格的安全路径")
-            if any(
-                part in {".", ".."} for part in values["install_dir"].split("/")
-            ):
-                raise ValueError("安装目录不能包含 . 或 ..")
+            validate_install_dir(values["install_dir"])
             session = self._new_session(values)
             try:
                 install_dir = values["install_dir"].strip()
@@ -1015,6 +1229,7 @@ def packaged_self_test(result_path: Path) -> int:
     required = (
         "payload/remote_install.sh",
         "payload/manage.sh",
+        "payload/backup_retention.sh",
         "payload/repair_clouddrive_network.sh",
         "payload/docker-compose.yml",
         "payload/.dockerignore",
@@ -1023,6 +1238,12 @@ def packaged_self_test(result_path: Path) -> int:
         "payload/app/__init__.py",
         "payload/app/config.py",
         "payload/app/main.py",
+        "payload/app/bot_commands.py",
+        "payload/app/interfaces.py",
+        "payload/app/states.py",
+        "payload/app/deployment_check.py",
+        "payload/app/backup_database.py",
+        "payload/app/naming.py",
         "payload/app/db.py",
         "payload/app/resources.py",
         "payload/app/rclone_client.py",
@@ -1030,14 +1251,28 @@ def packaged_self_test(result_path: Path) -> int:
         "payload/app/verify_destination.py",
     )
     missing = [name for name in required if not resource_path(name).is_file()]
+    gui_ok = False
+    try:
+        test_root = tk.Tk()
+        test_root.withdraw()
+        try:
+            InstallerApp(test_root)
+            test_root.update_idletasks()
+            gui_ok = True
+        finally:
+            test_root.destroy()
+    except tk.TclError:
+        pass
+    succeeded = not missing and gui_ok
     lines = [
         f"app_version={APP_VERSION}",
         f"paramiko_version={paramiko.__version__}",
         f"payload_missing={','.join(missing)}",
-        f"result={'FAILED' if missing else 'OK'}",
+        f"gui_runtime={'OK' if gui_ok else 'FAILED'}",
+        f"result={'OK' if succeeded else 'FAILED'}",
     ]
     result_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return 1 if missing else 0
+    return 0 if succeeded else 1
 
 
 if __name__ == "__main__":

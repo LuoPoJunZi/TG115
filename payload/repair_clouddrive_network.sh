@@ -78,8 +78,7 @@ command -v docker >/dev/null 2>&1 || fail "Docker 不可用"
 cd "$INSTALL_DIR"
 docker compose config --quiet
 
-# shellcheck disable=SC1091
-source "$INSTALL_DIR/.env"
+DEPLOY_CLOUDDRIVE2="$(awk -F= '$1=="DEPLOY_CLOUDDRIVE2" {print $2; exit}' .env)"
 DEPLOY_CLOUDDRIVE2="${DEPLOY_CLOUDDRIVE2%$'\r'}"
 
 docker network inspect tg115 >/dev/null 2>&1 || docker network create tg115 >/dev/null

@@ -30,9 +30,12 @@ def _int(name: str, default: int) -> int:
 def _float(name: str, default: float) -> float:
     value = os.getenv(name)
     try:
-        return float(value) if value is not None else default
+        result = float(value) if value is not None else default
+        if not math.isfinite(result):
+            raise ValueError("non-finite")
+        return result
     except ValueError as exc:
-        raise RuntimeError(f"配置 {name} 必须是数字") from exc
+        raise RuntimeError(f"配置 {name} 必须是有限数字") from exc
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,7 @@ class Settings:
     remote_health_interval: float
 
     @classmethod
-    def from_env(cls) -> Settings:
+    def from_env(cls, *, create_directories: bool = True) -> Settings:
         api_id = _int("TELEGRAM_API_ID", 0)
         allowed_user_id = _int("ALLOWED_USER_ID", 0)
         if api_id <= 0:
@@ -125,11 +128,14 @@ class Settings:
             <= 100
         ):
             raise RuntimeError("CPU 阈值必须满足 0 < LOW < HIGH < PRESSURE <= 100")
+        if not 0 < settings.memory_hard_min_bytes <= settings.memory_soft_min_bytes:
+            raise RuntimeError("内存阈值必须满足 0 < HARD <= SOFT")
         for path in (
             settings.data_dir,
             settings.download_dir,
             settings.log_dir,
             settings.rclone_config_path.parent,
         ):
-            path.mkdir(parents=True, exist_ok=True)
+            if create_directories:
+                path.mkdir(parents=True, exist_ok=True)
         return settings

@@ -13,3 +13,8 @@ uv run --with-requirements requirements-build.txt `
   --with-requirements payload/requirements.txt `
   python -m unittest discover -s tests -v
 ```
+
+真实本地 WebDAV 集成测试需要 `rclone` 在 PATH 中；缺少时明确跳过。
+Shell 故障回归需要 Bash（Windows 可通过 `TG115_TEST_BASH` 指定 Git Bash 的绝对路径）。
+Linux CI 安装两者并使用 Python 3.12 运行全部测试，Windows 使用 Python 3.13。
+测试只创建本机临时文件、模拟配置和回环 WebDAV 服务，不使用个人凭据或联系真实 VPS。
