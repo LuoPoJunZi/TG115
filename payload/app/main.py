@@ -82,6 +82,7 @@ class TransferService(CommandMixin):
         self._stop = asyncio.Event()
         self._finalize_lock = asyncio.Lock()
         self._orphan_cleanup_plan: dict[str, Any] | None = None
+        self._cancel_confirmations: dict[int, dict[str, Any]] = {}
         self._register_handlers()
 
     @property
@@ -121,6 +122,7 @@ class TransferService(CommandMixin):
 
     def _register_handlers(self) -> None:
         self.client.add_event_handler(self._on_message, events.NewMessage(incoming=True))
+        self.client.add_event_handler(self._on_callback, events.CallbackQuery())
 
     def _authorized(self, sender_id: int | None) -> bool:
         return sender_id == self.settings.allowed_user_id
@@ -136,6 +138,16 @@ class TransferService(CommandMixin):
         if photo_id is not None:
             return f"photo:{photo_id}"
         return None
+
+    async def _on_callback(self, event: events.CallbackQuery.Event) -> None:
+        if (
+            not self._authorized(event.sender_id)
+            or getattr(event, "chat_id", None) != self.settings.allowed_user_id
+        ):
+            self.log.warning("忽略未授权或非私聊按钮操作")
+            await event.answer("无权执行这个操作。", alert=True)
+            return
+        await self._handle_callback(event)
 
     async def _on_message(self, event: events.NewMessage.Event) -> None:
         if not self._authorized(event.sender_id) or not getattr(event, "is_private", False):
@@ -799,8 +811,7 @@ class TransferService(CommandMixin):
             f"任务：#{task_id}\n"
             f"文件：{task['file_name']}\n"
             f"CloudDrive2 路径：{final_remote}\n"
-            "这不代表 Bot 已自动验证 115 官方端。\n"
-            "人工确认记录不是必需操作；集中核验后可发送一次 /confirm all。"
+            "WebDAV 远端大小已经复验，本地临时文件已经清理。"
         )
 
     async def _upload_one(self, task_id: int) -> None:

@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import unicodedata
 import unittest
 from contextlib import closing
 from dataclasses import replace
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock, Mock, patch
 SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE / "payload"))
 
+from app.bot_commands import truncate_display
 from app.db import SCHEMA_VERSION, TaskDB
 from app.deployment_check import code_fingerprint, mismatched_keys
 from app.healthcheck import healthy
@@ -78,6 +80,155 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
         await self.service._on_message(event)
         self.assertTrue(self.db.is_paused())
         event.reply.assert_awaited_once()
+
+    async def test_help_does_not_advertise_retired_manual_confirmation(self) -> None:
+        event = SimpleNamespace(reply=AsyncMock())
+        await self.service._handle_command(event, "/help")
+        text = event.reply.await_args.args[0]
+        self.assertNotIn("/confirm", text)
+        self.assertNotIn("人工确认", text)
+
+    async def test_help_uses_aligned_labels_and_main_shortcuts(self) -> None:
+        event = SimpleNamespace(reply=AsyncMock())
+        await self.service._handle_command(event, "/help")
+        text = event.reply.await_args.args[0]
+        for line in text.splitlines():
+            if "：" in line:
+                self.assertEqual(len(line.split("：", 1)[0]), 4, line)
+        buttons = event.reply.await_args.kwargs["buttons"]
+        data = {button.data for row in buttons for button in row}
+        self.assertEqual(
+            data,
+            {
+                b"menu:status",
+                b"queue:1",
+                b"control:pause",
+                b"control:resume",
+                b"menu:doctor",
+                b"menu:orphans",
+            },
+        )
+
+    async def test_queue_pages_are_compact_and_navigable(self) -> None:
+        for message_id in range(1, 8):
+            self.task(message_id=message_id)
+        first = SimpleNamespace(reply=AsyncMock())
+        await self.service._handle_command(first, "/queue")
+        first_text = first.reply.await_args.args[0]
+        self.assertIn("当前页码：第 1 页", first_text)
+        self.assertIn("#7", first_text)
+        self.assertIn("#3", first_text)
+        self.assertNotIn("#2｜", first_text)
+        first_data = {
+            button.data
+            for row in first.reply.await_args.kwargs["buttons"]
+            for button in row
+        }
+        self.assertIn(b"queue:2", first_data)
+
+        second = SimpleNamespace(
+            sender_id=self.settings.allowed_user_id,
+            chat_id=self.settings.allowed_user_id,
+            data=b"queue:2",
+            answer=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        await self.service._on_callback(second)
+        second_text = second.edit.await_args.args[0]
+        self.assertIn("当前页码：第 2 页", second_text)
+        self.assertIn("#2", second_text)
+        self.assertIn("#1", second_text)
+        second.answer.assert_awaited_once_with()
+
+    async def test_unauthorized_callback_cannot_pause_scheduler(self) -> None:
+        event = SimpleNamespace(
+            sender_id=self.settings.allowed_user_id + 1,
+            chat_id=self.settings.allowed_user_id,
+            data=b"control:pause",
+            answer=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        await self.service._on_callback(event)
+        self.assertFalse(self.db.is_paused())
+        event.edit.assert_not_awaited()
+        event.answer.assert_awaited_once_with("无权执行这个操作。", alert=True)
+
+    async def test_cancel_button_requires_fresh_second_confirmation(self) -> None:
+        task = self.task()
+        preview = SimpleNamespace(
+            sender_id=self.settings.allowed_user_id,
+            chat_id=self.settings.allowed_user_id,
+            data=f"task:cancel:{task['id']}".encode(),
+            answer=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        await self.service._on_callback(preview)
+        self.assertEqual(self.db.get(task["id"])["state"], "queued")
+        self.assertIn("确认取消", preview.edit.await_args.args[0])
+        confirm_data = preview.edit.await_args.kwargs["buttons"][0][0].data
+
+        confirm = SimpleNamespace(
+            sender_id=self.settings.allowed_user_id,
+            chat_id=self.settings.allowed_user_id,
+            data=confirm_data,
+            answer=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        await self.service._on_callback(confirm)
+        self.assertEqual(self.db.get(task["id"])["state"], "cancelled")
+        self.assertIn("操作成功", confirm.edit.await_args.args[0])
+
+    async def test_expired_cancel_button_does_not_change_task(self) -> None:
+        task = self.task()
+        preview = SimpleNamespace(
+            sender_id=self.settings.allowed_user_id,
+            chat_id=self.settings.allowed_user_id,
+            data=f"task:cancel:{task['id']}".encode(),
+            answer=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        await self.service._on_callback(preview)
+        confirm_data = preview.edit.await_args.kwargs["buttons"][0][0].data
+        self.service._cancel_confirmations[task["id"]]["expires_at"] = 0
+        expired = SimpleNamespace(
+            sender_id=self.settings.allowed_user_id,
+            chat_id=self.settings.allowed_user_id,
+            data=confirm_data,
+            answer=AsyncMock(),
+            edit=AsyncMock(),
+        )
+        await self.service._on_callback(expired)
+        self.assertEqual(self.db.get(task["id"])["state"], "queued")
+        self.assertIn("已经过期", expired.edit.await_args.args[0])
+
+    def test_display_width_truncation_limits_long_file_names(self) -> None:
+        value = truncate_display("很长的中文文件名称" * 5, max_width=20)
+        width = sum(
+            2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+            for char in value
+        )
+        self.assertLessEqual(width, 20)
+        self.assertTrue(value.endswith("…"))
+
+    def test_all_structured_menu_fields_use_four_character_labels(self) -> None:
+        task = self.task()
+        rendered = (
+            self.service._format_help(),
+            self.service._queue_page(1)[0],
+            self.service._format_task(task, verbose=True),
+            self.service._format_status(),
+            self.service._format_doctor(),
+            self.service._format_operation_result(
+                status="操作成功",
+                operation="重新加入队列",
+                note="等待安全条件",
+                task=task,
+            ),
+        )
+        for text in rendered:
+            for line in text.splitlines():
+                if "：" in line:
+                    self.assertEqual(len(line.split("：", 1)[0]), 4, line)
 
     async def test_pause_survives_restart_and_prevents_new_transfers(self) -> None:
         self.task()
@@ -157,7 +308,7 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不代表可写", text)
         self.assertNotIn(self.settings.cd2_password, text)
         self.assertEqual(self.service.rclone.files, {})
-        self.assertIn("未验证写入", self.service._format_status())
+        self.assertIn("只读检查", self.service._format_status())
 
     async def test_cancel_before_move_cleans_both_recorded_paths(self) -> None:
         task = self.task(local=True)
@@ -304,6 +455,9 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.get(second["id"])["state"], "confirmed")
         self.assertEqual(self.db.get(pending["id"])["state"], "queued")
         self.assertIn("2 个任务", event.reply.await_args.args[0])
+        rendered = self.service._format_task(self.db.get(first["id"]), verbose=True)
+        self.assertIn("Bot 传输已完成", rendered)
+        self.assertNotIn("115 核验", rendered)
 
     async def test_orphan_audit_is_read_only_and_hides_file_names(self) -> None:
         tracked = self.task()

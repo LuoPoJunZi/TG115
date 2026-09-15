@@ -182,7 +182,8 @@ class EndToEndSimulationTests(unittest.TestCase):
                 text for text in notifications if "CloudDrive2 已接收" in text
             )
             self.assertIn("Bot 传输已完成", completion)
-            self.assertIn("/confirm all", completion)
+            self.assertIn("WebDAV 远端大小已经复验", completion)
+            self.assertNotIn("/confirm", completion)
             self.assertNotIn("正在后台上传到 115", completion)
             db.close()
 
@@ -493,8 +494,20 @@ class EndToEndSimulationTests(unittest.TestCase):
                     file_size=100,
                 )
                 db.update(task["id"], state="completed", remote_path="history.mp4")
+                confirmed, _ = db.create_task(
+                    chat_id=1,
+                    message_id=15,
+                    sender_id=settings.allowed_user_id,
+                    file_name="legacy.mp4",
+                    file_size=100,
+                )
+                db.update(
+                    confirmed["id"], state="completed", remote_path="legacy.mp4"
+                )
+                db.confirm_115(confirmed["id"])
                 service = make_service(settings, db)
                 service.destination_healthy = True
+                service.destination_scope = "target"
                 service.snapshot = None
                 service.download_window = SimpleNamespace(value=3)
                 service.upload_window = SimpleNamespace(value=2)
@@ -502,12 +515,18 @@ class EndToEndSimulationTests(unittest.TestCase):
                 text = service._format_status()
 
                 self.assertIn(
-                    "Bot 当前实际传输：下载/流式 0，落盘后上传 0",
+                    "当前传输：下载/流式 0，上传 0",
                     text,
                 )
-                self.assertIn("Bot 传输已完成（CloudDrive2 已接收） 1", text)
-                self.assertIn("/confirm <编号|all>", text)
-                self.assertNotIn("115 后台处理中", text)
+                self.assertIn("并发窗口：下载 3，上传 2", text)
+                self.assertIn("任务统计：Bot 完成 2", text)
+                self.assertNotIn("/confirm", text)
+                self.assertNotIn("115", text)
+                labelled = [line for line in text.splitlines() if "：" in line]
+                self.assertTrue(labelled)
+                self.assertTrue(
+                    all(len(line.split("：", 1)[0]) == 4 for line in labelled)
+                )
             finally:
                 db.close()
 

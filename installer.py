@@ -8,6 +8,7 @@ import os
 import re
 import select
 import shlex
+import socket
 import socketserver
 import sys
 import tarfile
@@ -170,6 +171,7 @@ class ForwardHandler(socketserver.BaseRequestHandler):
     ssh_transport: paramiko.Transport
     remote_host = "127.0.0.1"
     remote_port = 19798
+    report_error: Callable[[Exception], None]
 
     def handle(self) -> None:
         try:
@@ -177,10 +179,13 @@ class ForwardHandler(socketserver.BaseRequestHandler):
                 "direct-tcpip",
                 (self.remote_host, self.remote_port),
                 self.request.getpeername(),
+                timeout=10,
             )
-        except (OSError, paramiko.SSHException):
+        except (OSError, paramiko.SSHException) as exc:
+            self.report_error(exc)
             return
         if channel is None:
+            self.report_error(RuntimeError("SSH 服务没有创建端口转发通道"))
             return
         try:
             while True:
@@ -195,33 +200,110 @@ class ForwardHandler(socketserver.BaseRequestHandler):
                     if not data:
                         break
                     self.request.sendall(data)
+        except (OSError, EOFError, ValueError, paramiko.SSHException) as exc:
+            self.report_error(exc)
         finally:
             channel.close()
             self.request.close()
 
 
+class TunnelServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 class Tunnel:
-    def __init__(self, session: RemoteSession):
+    def __init__(self, session: RemoteSession, local_port: int = 19798):
         transport = session.client.get_transport()
         if transport is None:
             raise RuntimeError("SSH 连接不可用")
+        self._error_lock = threading.Lock()
+        self._last_error: Exception | None = None
+        self._closed = False
         handler_type = type(
             "CloudDriveForwardHandler",
             (ForwardHandler,),
-            {"ssh_transport": transport},
+            {
+                "ssh_transport": transport,
+                "report_error": staticmethod(self._report_error),
+            },
         )
         self.session = session
-        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler_type)
-        self.server.daemon_threads = True
+        try:
+            self.server = TunnelServer(("127.0.0.1", local_port), handler_type)
+        except OSError as exc:
+            raise RuntimeError(
+                f"本机 SSH 隧道端口 127.0.0.1:{local_port} 无法使用，"
+                "请关闭占用该端口的程序后重试。"
+            ) from exc
         self.port = int(self.server.server_address[1])
         self.thread = threading.Thread(
             target=self.server.serve_forever, name="cd2-tunnel", daemon=True
         )
 
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def _report_error(self, error: Exception) -> None:
+        with self._error_lock:
+            self._last_error = error
+
+    def _clear_error(self) -> None:
+        with self._error_lock:
+            self._last_error = None
+
+    def _get_error(self) -> Exception | None:
+        with self._error_lock:
+            return self._last_error
+
+    @staticmethod
+    def _probe_error(error: Exception | None) -> RuntimeError:
+        detail = str(error).strip() if error else "没有收到任何 HTTP 响应"
+        forwarding_denied = (
+            isinstance(error, paramiko.ChannelException)
+            and error.code == paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        ) or "administratively prohibited" in detail.lower()
+        if forwarding_denied:
+            return RuntimeError(
+                "VPS 的 SSH 服务禁止 TCP 端口转发。请检查 sshd 的 "
+                "AllowTcpForwarding，并允许 PermitOpen 127.0.0.1:19798；"
+                "部署器不会把 CloudDrive2 管理端口暴露到公网。"
+            )
+        return RuntimeError(
+            "SSH 隧道已建立，但没有收到 CloudDrive2 管理页响应："
+            f"{detail}。请关闭部署器后重试，并确认 VPS 本机的 19798 端口仍可访问。"
+        )
+
     def start(self) -> None:
         self.thread.start()
 
+    def probe(self, timeout: float = 10) -> None:
+        """Verify the exact local URL before handing it to a browser."""
+        self._clear_error()
+        request = (
+            "GET / HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{self.port}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", self.port), timeout=timeout
+            ) as connection:
+                connection.settimeout(timeout)
+                connection.sendall(request)
+                response = connection.recv(4096)
+        except OSError as exc:
+            error = self._get_error() or exc
+            raise self._probe_error(error) from error
+        if not response.startswith(b"HTTP/"):
+            error = self._get_error()
+            raise self._probe_error(error) from error
+
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self.server.shutdown()
         self.server.server_close()
         self.session.close()
@@ -1022,11 +1104,18 @@ class InstallerApp:
         def action() -> None:
             self._validate(values)
             if self.tunnel:
-                url = f"http://127.0.0.1:{self.tunnel.port}"
-                webbrowser.open(url)
-                self._log(f"CloudDrive2 管理页：{url}")
-                return
+                try:
+                    self.tunnel.probe()
+                except RuntimeError as exc:
+                    self._log(f"现有 SSH 隧道已失效，正在自动重建：{exc}")
+                    self.tunnel.close()
+                    self.tunnel = None
+                else:
+                    webbrowser.open(self.tunnel.url)
+                    self._log(f"CloudDrive2 管理页：{self.tunnel.url}")
+                    return
             session = self._new_session(values)
+            tunnel: Tunnel | None = None
             try:
                 code, _ = session.run(
                     "curl -fsS --max-time 10 http://127.0.0.1:19798/ >/dev/null"
@@ -1037,19 +1126,24 @@ class InstallerApp:
                     )
                 tunnel = Tunnel(session)
                 tunnel.start()
+                tunnel.probe()
                 self.tunnel = tunnel
-                url = f"http://127.0.0.1:{tunnel.port}"
-                self._log(f"SSH 安全隧道已开启：{url}")
+                url = tunnel.url
+                self._log(f"SSH 安全隧道已验收：{url}")
                 webbrowser.open(url)
                 self.root.after(
                     0,
                     lambda: messagebox.showinfo(
                         "CloudDrive2 管理页",
-                        "管理页已通过 SSH 隧道打开。部署器关闭时隧道会自动关闭。",
+                        "管理页已通过真实 HTTP 请求验收并打开。"
+                        "部署器关闭时 SSH 隧道会自动关闭。",
                     ),
                 )
             except Exception:
-                session.close()
+                if tunnel:
+                    tunnel.close()
+                else:
+                    session.close()
                 raise
 
         self._run_worker(action)

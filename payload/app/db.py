@@ -249,12 +249,15 @@ class TaskDB:
                 for row in self._conn.execute(query, params).fetchall()
             ]
 
-    def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_recent(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        if limit <= 0 or offset < 0:
+            raise ValueError("limit 必须大于 0，offset 不能小于 0")
         with self._lock:
             return [
                 dict(row)
                 for row in self._conn.execute(
-                    "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)
+                    "SELECT * FROM tasks ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
                 ).fetchall()
             ]
 

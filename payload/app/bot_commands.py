@@ -3,20 +3,57 @@ from __future__ import annotations
 import asyncio
 import secrets
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
-from telethon import events
+from telethon import Button, events
+from telethon.errors import MessageNotModifiedError
 
 from .states import FAILED_STATES, STATE_LABELS
 
 ORPHAN_CLEANUP_LIMIT = 100
 ORPHAN_CLEANUP_TTL_SECONDS = 5 * 60
+TASK_ACTION_TTL_SECONDS = 5 * 60
+QUEUE_PAGE_SIZE = 5
+MAX_QUEUE_PAGE = 10_000
 TERMINAL_TASK_STATES = {"completed", "confirmed", "cancelled"}
 
 
 def state_label(state: str) -> str:
+    # Keep the persisted legacy state distinct for recovery compatibility, but
+    # do not expose the retired manual-confirmation workflow in normal Bot UI.
+    if state == "confirmed":
+        state = "completed"
     return STATE_LABELS.get(state, state)
+
+
+def format_status_counts(counts: dict[str, int]) -> str:
+    groups = (
+        ("排队", ("queued", "reserved")),
+        ("下载中", ("downloading",)),
+        ("待上传", ("downloaded", "waiting_upload")),
+        (
+            "上传中",
+            ("uploading", "streaming", "verifying", "finalizing", "cleanup_pending"),
+        ),
+        ("Bot 完成", ("completed", "confirmed")),
+        ("失败", tuple(FAILED_STATES)),
+        ("已取消", ("cancelled",)),
+    )
+    parts: list[str] = []
+    known: set[str] = set()
+    for label, states in groups:
+        known.update(states)
+        total = sum(counts.get(state, 0) for state in states)
+        if total:
+            parts.append(f"{label} {total}")
+    parts.extend(
+        f"{state_label(state)} {count}"
+        for state, count in sorted(counts.items())
+        if state not in known and count
+    )
+    return "，".join(parts) or "无任务"
 
 
 def format_bytes(value: float) -> str:
@@ -28,8 +65,409 @@ def format_bytes(value: float) -> str:
     return f"{size:.2f}TB"
 
 
+def format_rate(value: float) -> str:
+    return "0B/s" if value <= 0 else f"{format_bytes(value)}/s"
+
+
+def truncate_display(text: str, max_width: int = 32) -> str:
+    """Truncate a Telegram label by approximate rendered character width."""
+    if max_width < 2:
+        raise ValueError("max_width 必须至少为 2")
+    current = 0
+    result: list[str] = []
+    for index, char in enumerate(text):
+        width = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        )
+        if current + width > max_width or (
+            index < len(text) - 1 and current + width >= max_width
+        ):
+            return "".join(result) + "…"
+        result.append(char)
+        current += width
+    return "".join(result)
+
+
 class CommandMixin:
     """Telegram command routing and user-facing status rendering."""
+
+    @staticmethod
+    def _format_help() -> str:
+        return (
+            "使用帮助\n\n"
+            "提交文件：直接发送或转发视频、文档等文件\n"
+            "状态查看：/status、/queue [页码]\n"
+            "任务查看：/task <编号>\n"
+            "进度跟踪：/watch <编号>\n"
+            "失败重试：/retry <编号|all>\n"
+            "取消任务：/cancel <编号>\n"
+            "流式传输：/stream <编号>\n"
+            "调度控制：/pause、/resume\n"
+            "运行诊断：/doctor\n"
+            "临时巡检：/orphans"
+        )
+
+    @staticmethod
+    def _main_buttons() -> list[list[Any]]:
+        return [
+            [
+                Button.inline("系统状态", data=b"menu:status"),
+                Button.inline("最近任务", data=b"queue:1"),
+            ],
+            [
+                Button.inline("暂停调度", data=b"control:pause"),
+                Button.inline("恢复调度", data=b"control:resume"),
+            ],
+            [
+                Button.inline("运行诊断", data=b"menu:doctor"),
+                Button.inline("临时巡检", data=b"menu:orphans"),
+            ],
+        ]
+
+    @staticmethod
+    def _secondary_buttons(refresh_data: bytes) -> list[list[Any]]:
+        return [
+            [
+                Button.inline("刷新页面", data=refresh_data),
+                Button.inline("返回菜单", data=b"menu:home"),
+            ]
+        ]
+
+    def _task_buttons(self, task: dict[str, Any] | None) -> list[list[Any]]:
+        if task is None:
+            return self._secondary_buttons(b"queue:1")
+        task_id = int(task["id"])
+        rows: list[list[Any]] = [
+            [
+                Button.inline("刷新进度", data=f"task:view:{task_id}".encode()),
+                Button.inline("最近任务", data=b"queue:1"),
+            ]
+        ]
+        actions: list[Any] = []
+        if task["state"] in FAILED_STATES or task.get("cancel_requested"):
+            actions.append(
+                Button.inline("重新排队", data=f"task:retry:{task_id}".encode())
+            )
+        if (
+            task["state"] in {"queued", "download_failed"}
+            and not task.get("local_path")
+            and task.get("transfer_mode") != "stream"
+            and not task.get("cancel_requested")
+        ):
+            actions.append(
+                Button.inline("切换流式", data=f"task:stream:{task_id}".encode())
+            )
+        if actions:
+            rows.append(actions)
+        if task["state"] not in {
+            "completed",
+            "confirmed",
+            "cleanup_pending",
+            "cancelled",
+        }:
+            rows.append(
+                [Button.inline("取消任务", data=f"task:cancel:{task_id}".encode())]
+            )
+        rows.append([Button.inline("返回菜单", data=b"menu:home")])
+        return rows
+
+    @staticmethod
+    def _format_operation_result(
+        *, status: str, operation: str, note: str, task: dict[str, Any] | None = None
+    ) -> str:
+        lines = ["操作结果", "", f"执行状态：{status}"]
+        if task is not None:
+            lines.extend(
+                (
+                    f"任务编号：#{task['id']}",
+                    f"执行操作：{operation}",
+                    f"当前状态：{state_label(task['state'])}",
+                )
+            )
+        else:
+            lines.append(f"执行操作：{operation}")
+        lines.append(f"后续说明：{note}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_queue_page(parts: list[str]) -> int | None:
+        if len(parts) == 1:
+            return 1
+        if len(parts) != 2:
+            return None
+        try:
+            page = int(parts[1])
+        except ValueError:
+            return None
+        return page if 1 <= page <= MAX_QUEUE_PAGE else None
+
+    def _queue_page(
+        self, page: int
+    ) -> tuple[str, list[dict[str, Any]], bool]:
+        offset = (page - 1) * QUEUE_PAGE_SIZE
+        fetched = self.db.list_recent(QUEUE_PAGE_SIZE + 1, offset=offset)
+        tasks = fetched[:QUEUE_PAGE_SIZE]
+        has_next = len(fetched) > QUEUE_PAGE_SIZE
+        if not tasks:
+            return (
+                (
+                    "最近任务\n\n"
+                    f"当前页码：第 {page} 页\n"
+                    "任务列表：这一页没有任务"
+                ),
+                [],
+                False,
+            )
+        text = (
+            "最近任务\n\n"
+            f"当前页码：第 {page} 页\n\n"
+            + "\n\n".join(self._format_queue_task(task) for task in tasks)
+        )
+        return text, tasks, has_next
+
+    def _queue_buttons(
+        self, page: int, tasks: list[dict[str, Any]], has_next: bool
+    ) -> list[list[Any]]:
+        task_buttons = [
+            Button.inline(
+                f"查看 #{task['id']}", data=f"task:view:{task['id']}".encode()
+            )
+            for task in tasks
+        ]
+        rows = [task_buttons[index:index + 2] for index in range(0, len(task_buttons), 2)]
+        navigation: list[Any] = []
+        if page > 1:
+            navigation.append(Button.inline("上一页", data=f"queue:{page - 1}".encode()))
+        if has_next:
+            navigation.append(Button.inline("下一页", data=f"queue:{page + 1}".encode()))
+        if navigation:
+            rows.append(navigation)
+        rows.append(
+            [
+                Button.inline("系统状态", data=b"menu:status"),
+                Button.inline("返回菜单", data=b"menu:home"),
+            ]
+        )
+        return rows
+
+    async def _reply_queue(self, event: Any, page: int) -> None:
+        text, tasks, has_next = self._queue_page(page)
+        await event.reply(text, buttons=self._queue_buttons(page, tasks, has_next))
+
+    async def _edit_callback(
+        self, event: Any, text: str, buttons: list[list[Any]]
+    ) -> None:
+        try:
+            await event.edit(text, buttons=buttons)
+        except MessageNotModifiedError:
+            return
+
+    async def _callback_command(
+        self,
+        event: Any,
+        handler: Any,
+        parts: list[str],
+        task_id: int,
+    ) -> None:
+        owner = self
+
+        class EditReplyProxy:
+            async def reply(self, text: str, **_: Any) -> None:
+                task = owner.db.get(task_id)
+                await owner._edit_callback(event, text, owner._task_buttons(task))
+
+        await handler(EditReplyProxy(), parts)
+
+    async def _show_orphans_callback(self, event: Any) -> None:
+        try:
+            orphans = await self._find_orphan_staging()
+        except NotImplementedError:
+            text = "临时巡检\n\n巡检结果：当前目的端不支持巡检"
+        except Exception as exc:  # noqa: BLE001 - external diagnostic boundary
+            self.log.warning("远端临时文件巡检失败：%s", exc)
+            text = "临时巡检\n\n巡检结果：远端巡检失败\n安全处理：没有执行删除操作"
+        else:
+            if not orphans:
+                text = (
+                    "临时巡检\n\n"
+                    "巡检结果：没有发现疑似遗留文件\n"
+                    "安全处理：本次只读检查，没有删除内容"
+                )
+            else:
+                shown = "、".join(f"#{task_id}" for task_id, _ in orphans[:20])
+                suffix = "（仅显示前 20 项）" if len(orphans) > 20 else ""
+                text = (
+                    "临时巡检\n\n"
+                    f"巡检结果：发现 {len(orphans)} 个疑似遗留文件\n"
+                    f"任务编号：{shown}{suffix}\n"
+                    "安全处理：本次没有删除任何内容\n"
+                    "清理方式：发送 /orphans clean 获取一次性确认码"
+                )
+        await self._edit_callback(
+            event, text, self._secondary_buttons(b"menu:orphans")
+        )
+
+    async def _handle_callback(self, event: Any) -> None:
+        try:
+            data = bytes(event.data).decode("ascii")
+            parts = data.split(":")
+            if data in {"menu:home", "menu:status", "menu:doctor", "menu:orphans"}:
+                action: tuple[str, Any] = (data, None)
+            elif len(parts) == 2 and parts[0] == "queue":
+                page = int(parts[1])
+                if not 1 <= page <= MAX_QUEUE_PAGE:
+                    raise ValueError
+                action = ("queue", page)
+            elif len(parts) == 2 and parts[0] == "control" and parts[1] in {"pause", "resume"}:
+                action = ("control", parts[1])
+            elif (
+                len(parts) == 3
+                and parts[0] == "task"
+                and parts[1] in {"view", "retry", "stream", "cancel"}
+            ):
+                task_id = int(parts[2])
+                if task_id <= 0:
+                    raise ValueError
+                action = (f"task:{parts[1]}", task_id)
+            elif (
+                len(parts) == 4
+                and parts[0] == "task"
+                and parts[1] in {"cancel_yes", "cancel_no"}
+                and parts[3]
+            ):
+                task_id = int(parts[2])
+                if task_id <= 0:
+                    raise ValueError
+                action = (f"task:{parts[1]}", (task_id, parts[3]))
+            else:
+                raise ValueError
+        except (UnicodeDecodeError, ValueError, TypeError):
+            await event.answer("按钮已经失效，请发送 /help 重新打开菜单。", alert=True)
+            return
+
+        await event.answer()
+        name, value = action
+        if name == "menu:home":
+            await self._edit_callback(event, self._format_help(), self._main_buttons())
+        elif name == "menu:status":
+            await self._edit_callback(event, self._format_status(), self._main_buttons())
+        elif name == "menu:doctor":
+            await self._edit_callback(
+                event,
+                self._format_doctor(),
+                self._secondary_buttons(b"menu:doctor"),
+            )
+        elif name == "menu:orphans":
+            await self._show_orphans_callback(event)
+        elif name == "queue":
+            text, tasks, has_next = self._queue_page(value)
+            await self._edit_callback(
+                event, text, self._queue_buttons(value, tasks, has_next)
+            )
+        elif name == "control":
+            paused = value == "pause"
+            self.db.set_paused(paused)
+            text = self._format_operation_result(
+                status="操作成功",
+                operation="暂停新任务调度" if paused else "恢复任务调度",
+                note=(
+                    "活动任务继续完成，暂停状态会在重启后保留"
+                    if paused
+                    else "新任务仍需满足目的端与资源安全条件"
+                ),
+            )
+            await self._edit_callback(event, text, self._main_buttons())
+        elif name == "task:view":
+            task = self.db.get(value)
+            text = (
+                self._format_task(task, verbose=True)
+                if task
+                else "任务详情\n\n查询结果：没有找到这个任务"
+            )
+            await self._edit_callback(event, text, self._task_buttons(task))
+        elif name in {"task:retry", "task:stream"}:
+            command = "/retry" if name == "task:retry" else "/stream"
+            handler = self._command_retry if name == "task:retry" else self._command_stream
+            await self._callback_command(event, handler, [command, str(value)], value)
+        elif name == "task:cancel":
+            task = self.db.get(value)
+            if task is None:
+                await self._edit_callback(
+                    event,
+                    "确认取消\n\n查询结果：没有找到这个任务",
+                    self._secondary_buttons(b"queue:1"),
+                )
+                return
+            if task["state"] in {
+                "completed", "confirmed", "cleanup_pending", "cancelled",
+            }:
+                await self._edit_callback(
+                    event, self._format_task(task, verbose=True), self._task_buttons(task)
+                )
+                return
+            token = secrets.token_hex(3)
+            confirmations = getattr(self, "_cancel_confirmations", {})
+            confirmations[int(task["id"])] = {
+                "token": token,
+                "expires_at": time.monotonic() + TASK_ACTION_TTL_SECONDS,
+            }
+            self._cancel_confirmations = confirmations
+            text = (
+                "确认取消\n\n"
+                f"任务编号：#{task['id']}\n"
+                f"文件名称：{truncate_display(str(task['file_name']))}\n"
+                f"当前状态：{state_label(task['state'])}\n"
+                "操作影响：清理本地临时文件及本任务远端文件\n"
+                "安全说明：远端无法确认删除时会中止并保留本地数据\n"
+                "有效时间：请在 5 分钟内确认"
+            )
+            buttons = [[
+                Button.inline(
+                    "确认取消", data=f"task:cancel_yes:{task['id']}:{token}".encode()
+                ),
+                Button.inline(
+                    "放弃操作", data=f"task:cancel_no:{task['id']}:{token}".encode()
+                ),
+            ]]
+            await self._edit_callback(event, text, buttons)
+        else:
+            task_id, token = value
+            plan = getattr(self, "_cancel_confirmations", {}).get(task_id)
+            valid = bool(
+                plan
+                and time.monotonic() <= float(plan["expires_at"])
+                and secrets.compare_digest(str(plan["token"]), token)
+            )
+            if not valid:
+                if plan and time.monotonic() > float(plan["expires_at"]):
+                    self._cancel_confirmations.pop(task_id, None)
+                await self._edit_callback(
+                    event,
+                    "确认取消\n\n确认状态：按钮不存在或已经过期\n"
+                    "后续操作：请重新打开任务详情",
+                    self._task_buttons(self.db.get(task_id)),
+                )
+                return
+            self._cancel_confirmations.pop(task_id, None)
+            if name == "task:cancel_no":
+                task = self.db.get(task_id)
+                await self._edit_callback(
+                    event,
+                    self._format_operation_result(
+                        status="已经放弃",
+                        operation="取消任务",
+                        note="任务保持原状态，没有删除任何内容",
+                        task=task,
+                    ),
+                    self._task_buttons(task),
+                )
+            else:
+                await self._callback_command(
+                    event,
+                    self._command_cancel,
+                    ["/cancel", str(task_id)],
+                    task_id,
+                )
 
     async def _handle_command(
         self, event: events.NewMessage.Event, text: str
@@ -37,31 +475,18 @@ class CommandMixin:
         parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         if command in {"/start", "/help"}:
-            await event.reply(
-                "把视频或文件直接转发给我即可。\n\n"
-                "/queue - 查看最近任务\n"
-                "/status - 查看系统状态\n"
-                "/doctor - 只读诊断（不写远端）\n"
-                "/pause /resume - 暂停／恢复新任务调度\n"
-                "/task <编号> - 查看单个任务\n"
-                "/watch <编号> - 每 5 秒更新同一条进度消息\n"
-                "/stream <编号> - 将排队或下载失败任务改为流式传输\n"
-                "/orphans - 只读巡检远端临时文件；clean 需二次确认\n"
-                "/confirm <编号|all> - 记录单个或批量 115 人工确认\n"
-                "/retry <编号|all> - 重试失败任务（all 每次最多 100 个）\n"
-                "/cancel <编号> - 取消任务"
-            )
+            await event.reply(self._format_help(), buttons=self._main_buttons())
         elif command == "/queue":
-            tasks = self.db.list_recent(15)
-            if not tasks:
-                await event.reply("当前没有任务。")
-            else:
+            page = self._parse_queue_page(parts)
+            if page is None:
                 await event.reply(
-                    "最近任务：\n\n"
-                    + "\n\n".join(self._format_task(task) for task in tasks)
+                    "使用说明\n\n正确格式：/queue [页码]",
+                    buttons=self._secondary_buttons(b"queue:1"),
                 )
+            else:
+                await self._reply_queue(event, page)
         elif command in {"/status", "/performance"}:
-            await event.reply(self._format_status())
+            await event.reply(self._format_status(), buttons=self._main_buttons())
         elif command == "/task":
             await self._command_task(event, parts)
         elif command == "/watch":
@@ -75,11 +500,24 @@ class CommandMixin:
         elif command in {"/pause", "/resume"}:
             self.db.set_paused(command == "/pause")
             await event.reply(
-                "已暂停启动新传输；活动任务继续完成，暂停状态在重启后保留。"
-                if command == "/pause" else "已恢复调度；仍需满足远端和资源安全条件。"
+                self._format_operation_result(
+                    status="操作成功",
+                    operation=(
+                        "暂停新任务调度" if command == "/pause" else "恢复任务调度"
+                    ),
+                    note=(
+                        "活动任务继续完成，暂停状态会在重启后保留"
+                        if command == "/pause"
+                        else "新任务仍需满足目的端与资源安全条件"
+                    ),
+                ),
+                buttons=self._main_buttons(),
             )
         elif command == "/doctor":
-            await event.reply(self._format_doctor())
+            await event.reply(
+                self._format_doctor(),
+                buttons=self._secondary_buttons(b"menu:doctor"),
+            )
         elif command == "/stream":
             await self._command_stream(event, parts)
         elif command == "/orphans":
@@ -108,9 +546,14 @@ class CommandMixin:
         task_id = self._parse_task_id(parts)
         task = self.db.get(task_id) if task_id else None
         if task is None:
-            await event.reply("用法：/task <任务编号>")
+            await event.reply(
+                "使用说明\n\n正确格式：/task <任务编号>",
+                buttons=self._secondary_buttons(b"queue:1"),
+            )
             return
-        await event.reply(self._format_task(task, verbose=True))
+        await event.reply(
+            self._format_task(task, verbose=True), buttons=self._task_buttons(task)
+        )
 
     async def _command_confirm(
         self, event: events.NewMessage.Event, parts: list[str]
@@ -162,15 +605,34 @@ class CommandMixin:
         if result == "missing" or task is None:
             await event.reply("没有找到这个任务。用法：/stream <任务编号>")
         elif result == "retained":
-            await event.reply("该任务已有本地完整文件；请保留可恢复上传能力，不切换流式模式。")
+            await event.reply(
+                self._format_operation_result(
+                    status="没有执行",
+                    operation="切换流式传输",
+                    note="已有完整本地文件，应保留可恢复上传能力",
+                    task=task,
+                ),
+                buttons=self._task_buttons(task),
+            )
         elif result == "invalid":
             await event.reply(
-                f"任务当前状态为“{state_label(task['state'])}”，不能切换流式模式。"
+                self._format_operation_result(
+                    status="没有执行",
+                    operation="切换流式传输",
+                    note="当前任务状态不支持切换流式模式",
+                    task=task,
+                ),
+                buttons=self._task_buttons(task),
             )
         else:
             await event.reply(
-                f"任务 #{task_id} 已改为流式传输并重新排队。\n"
-                "流式模式不保留完整本地副本，中断后通常需要从头重传。"
+                self._format_operation_result(
+                    status="操作成功",
+                    operation="切换流式传输",
+                    note="已重新排队；中断后通常需要从头传输",
+                    task=task,
+                ),
+                buttons=self._task_buttons(task),
             )
 
     def _is_orphan_staging(self, task_id: int, remote_path: str) -> bool:
@@ -207,7 +669,11 @@ class CommandMixin:
             len(parts) >= 2 and parts[1].lower() != "clean"
         ):
             await event.reply(
-                "用法：/orphans（只读巡检）或 /orphans clean（二次确认清理）"
+                "使用说明\n\n"
+                "只读巡检：/orphans\n"
+                "准备清理：/orphans clean\n"
+                "确认清理：按 Bot 返回的一次性确认码操作",
+                buttons=self._secondary_buttons(b"menu:orphans"),
             )
             return
         if len(parts) == 3:
@@ -216,21 +682,37 @@ class CommandMixin:
         try:
             orphans = await self._find_orphan_staging()
         except NotImplementedError:
-            await event.reply("当前目的端不支持远端临时文件巡检。")
+            await event.reply(
+                "临时巡检\n\n巡检结果：当前目的端不支持巡检",
+                buttons=self._secondary_buttons(b"menu:orphans"),
+            )
             return
         except Exception as exc:  # noqa: BLE001 - external diagnostic boundary
             self.log.warning("远端临时文件巡检失败：%s", exc)
-            await event.reply("远端临时文件巡检失败；未执行任何删除操作。")
+            await event.reply(
+                "临时巡检\n\n巡检结果：远端巡检失败\n"
+                "安全处理：未执行任何删除操作",
+                buttons=self._secondary_buttons(b"menu:orphans"),
+            )
             return
         if not orphans:
-            await event.reply("只读巡检完成：没有发现未被活动任务跟踪的 .uploading-* 文件。")
+            await event.reply(
+                "临时巡检\n\n"
+                "巡检结果：没有发现疑似遗留文件\n"
+                "安全处理：本次只读检查，没有删除内容",
+                buttons=self._secondary_buttons(b"menu:orphans"),
+            )
             return
         shown = "、".join(f"#{task_id}" for task_id, _ in orphans[:20])
         suffix = "（仅显示前 20 项）" if len(orphans) > 20 else ""
         if len(parts) == 1:
             await event.reply(
-                f"只读巡检发现 {len(orphans)} 个疑似遗留临时文件：{shown}{suffix}\n"
-                "本命令未删除任何内容；如需清理，发送 /orphans clean 获取一次性确认码。"
+                "临时巡检\n\n"
+                f"巡检结果：发现 {len(orphans)} 个疑似遗留文件\n"
+                f"任务编号：{shown}{suffix}\n"
+                "安全处理：本次没有删除任何内容\n"
+                "清理方式：发送 /orphans clean 获取一次性确认码",
+                buttons=self._secondary_buttons(b"menu:orphans"),
             )
             return
         planned = tuple(orphans[:ORPHAN_CLEANUP_LIMIT])
@@ -245,9 +727,12 @@ class CommandMixin:
             if len(orphans) > ORPHAN_CLEANUP_LIMIT else ""
         )
         await event.reply(
-            f"待清理 {len(planned)} 个疑似遗留临时文件{limited}。\n"
-            f"5 分钟内发送 /orphans clean {token} 二次确认。\n"
-            "确认时会重新扫描；已关联活动任务的文件不会删除，确认码只能使用一次。"
+            "清理确认\n\n"
+            f"待清数量：{len(planned)} 个疑似遗留文件{limited}\n"
+            "有效时间：5 分钟\n"
+            f"确认命令：/orphans clean {token}\n"
+            "安全说明：确认时重新扫描，活动任务文件不会删除",
+            buttons=self._secondary_buttons(b"menu:orphans"),
         )
 
     async def _confirm_orphan_cleanup(
@@ -256,10 +741,20 @@ class CommandMixin:
         plan = getattr(self, "_orphan_cleanup_plan", None)
         if not plan or time.monotonic() > float(plan["expires_at"]):
             self._orphan_cleanup_plan = None
-            await event.reply("清理确认码不存在或已过期；请重新发送 /orphans clean。")
+            await event.reply(
+                "清理结果\n\n执行状态：没有执行\n"
+                "失败原因：确认码不存在或已过期\n"
+                "后续操作：请重新发送 /orphans clean",
+                buttons=self._secondary_buttons(b"menu:orphans"),
+            )
             return
         if not secrets.compare_digest(str(plan["token"]), token):
-            await event.reply("清理确认码不正确；未删除任何内容。")
+            await event.reply(
+                "清理结果\n\n执行状态：没有执行\n"
+                "失败原因：清理确认码不正确\n"
+                "安全处理：未删除任何内容",
+                buttons=self._secondary_buttons(b"menu:orphans"),
+            )
             return
         # Consume before any mutation so retries cannot replay a partially used plan.
         self._orphan_cleanup_plan = None
@@ -267,7 +762,12 @@ class CommandMixin:
             current = set(await self._find_orphan_staging())
         except Exception as exc:  # noqa: BLE001 - fail closed on rescan
             self.log.warning("清理前重新巡检远端临时文件失败：%s", exc)
-            await event.reply("清理前重新巡检失败；未删除任何内容，请重新发起巡检。")
+            await event.reply(
+                "清理结果\n\n执行状态：清理中止\n"
+                "失败原因：清理前重新巡检失败\n"
+                "安全处理：未删除任何内容，请重新发起巡检",
+                buttons=self._secondary_buttons(b"menu:orphans"),
+            )
             return
         deleted = 0
         protected = 0
@@ -284,14 +784,21 @@ class CommandMixin:
             except Exception as exc:  # noqa: BLE001 - fail closed on remote cleanup
                 self.log.warning("远端遗留临时文件清理失败：%s", exc)
                 await event.reply(
-                    f"清理在删除 {deleted} 个后停止：无法确认下一项已安全删除。\n"
-                    f"另有 {protected} 个已消失或受任务保护；请重新 /orphans 巡检。"
+                    "清理结果\n\n"
+                    f"执行状态：清理在删除 {deleted} 个后停止\n"
+                    "失败原因：无法确认下一项已经安全删除\n"
+                    f"跳过数量：{protected} 个已消失或受任务保护\n"
+                    "后续操作：请重新执行 /orphans 巡检",
+                    buttons=self._secondary_buttons(b"menu:orphans"),
                 )
                 return
             deleted += 1
         await event.reply(
-            f"清理完成：已删除并复查 {deleted} 个遗留临时文件；"
-            f"跳过 {protected} 个已消失或已受任务保护的文件。"
+            "清理结果\n\n"
+            "执行状态：清理完成\n"
+            f"删除数量：已删除并复查 {deleted} 个遗留临时文件\n"
+            f"跳过数量：跳过 {protected} 个已消失或受任务保护的文件",
+            buttons=self._secondary_buttons(b"menu:orphans"),
         )
 
     async def _command_retry(
@@ -305,7 +812,12 @@ class CommandMixin:
                 if not task.get("cancel_requested")
             )
             await event.reply(
-                f"已重新排队 {count} 个失败任务；取消清理未完成的任务不参与批量重试。"
+                self._format_operation_result(
+                    status="操作成功",
+                    operation="批量重试失败任务",
+                    note=f"已重新排队 {count} 个；取消清理中的任务不会参与",
+                ),
+                buttons=self._main_buttons(),
             )
             return
         task_id = self._parse_task_id(parts)
@@ -314,10 +826,25 @@ class CommandMixin:
             await event.reply("用法：/retry <任务编号>")
             return
         if self._retry_task(task):
-            await event.reply(f"任务 #{task_id} 已重新进入队列。")
+            updated = self.db.get(task_id)
+            await event.reply(
+                self._format_operation_result(
+                    status="操作成功",
+                    operation="重新加入队列",
+                    note="满足目的端与资源安全条件后自动开始",
+                    task=updated,
+                ),
+                buttons=self._task_buttons(updated),
+            )
         else:
             await event.reply(
-                f"任务当前状态为“{state_label(task['state'])}”，不需要手动重试。"
+                self._format_operation_result(
+                    status="没有执行",
+                    operation="重新加入队列",
+                    note="当前任务状态不需要手动重试",
+                    task=task,
+                ),
+                buttons=self._task_buttons(task),
             )
 
     def _retry_task(self, task: dict[str, Any]) -> bool:
@@ -388,7 +915,7 @@ class CommandMixin:
         task_id = self._parse_task_id(parts)
         task = self.db.get(task_id) if task_id else None
         if task is None:
-            await event.reply("用法：/cancel <任务编号>")
+            await event.reply("使用说明\n\n正确格式：/cancel <任务编号>")
             return
         if task["state"] in {
             "completed",
@@ -396,7 +923,14 @@ class CommandMixin:
             "cleanup_pending",
             "cancelled",
         }:
-            await event.reply(f"任务已经是“{state_label(task['state'])}”状态。")
+            await event.reply(
+                self._format_operation_result(
+                    status="没有执行",
+                    operation="取消任务",
+                    note="当前任务已经结束或正在执行最终清理",
+                    task=task,
+                )
+            )
             return
         self.db.update(
             task_id,
@@ -409,7 +943,10 @@ class CommandMixin:
             await asyncio.gather(running, return_exceptions=True)
         task = self.db.get(task_id)
         if task is None:
-            await event.reply("任务记录已经不存在，取消中止。")
+            await event.reply(
+                "操作结果\n\n执行状态：已经中止\n"
+                "执行操作：取消任务\n后续说明：任务记录已经不存在"
+            )
             return
         if task["state"] in {
             "completed",
@@ -417,7 +954,14 @@ class CommandMixin:
             "cleanup_pending",
             "cancelled",
         }:
-            await event.reply(f"任务已经是“{state_label(task['state'])}”状态。")
+            await event.reply(
+                self._format_operation_result(
+                    status="没有执行",
+                    operation="取消任务",
+                    note="任务已在等待期间结束或进入最终清理",
+                    task=task,
+                )
+            )
             return
         remote_paths = dict.fromkeys(
             str(task.get(key) or "")
@@ -431,8 +975,12 @@ class CommandMixin:
                     raise RuntimeError("远端文件删除后仍然存在")
             except Exception as exc:  # noqa: BLE001 - fail closed on remote cleanup
                 await event.reply(
-                    "CloudDrive2 远端文件暂时无法安全清理，取消中止；"
-                    f"本地副本已保留：{exc}"
+                    self._format_operation_result(
+                    status="取消中止",
+                        operation="取消任务",
+                        note=f"远端无法确认安全清理，本地副本已保留：{exc}",
+                        task=task,
+                    )
                 )
                 return
         local_path = Path(task["local_path"]) if task.get("local_path") else None
@@ -440,14 +988,28 @@ class CommandMixin:
             try:
                 local_path.unlink()
             except OSError as exc:
-                await event.reply(f"无法安全删除本地文件，取消中止：{exc}")
+                await event.reply(
+                    self._format_operation_result(
+                        status="取消中止",
+                        operation="取消任务",
+                        note=f"无法安全删除本地文件：{exc}",
+                        task=task,
+                    )
+                )
                 return
         part = self.settings.download_dir / f"{task_id}.part"
         if part.exists():
             try:
                 part.unlink()
             except OSError as exc:
-                await event.reply(f"无法安全删除下载临时文件，取消中止：{exc}")
+                await event.reply(
+                    self._format_operation_result(
+                        status="取消中止",
+                        operation="取消任务",
+                        note=f"无法安全删除下载临时文件：{exc}",
+                        task=task,
+                    )
+                )
                 return
         self.db.transition(
             task_id,
@@ -462,60 +1024,76 @@ class CommandMixin:
             error=None,
             wait_reason=None,
         )
+        updated = self.db.get(task_id)
         await event.reply(
-            f"任务 #{task_id} 已取消，本地临时文件和本任务远端文件已清理。"
+            self._format_operation_result(
+                status="操作成功",
+                operation="取消任务",
+                note="本地临时文件和本任务远端文件已经清理",
+                task=updated,
+            )
         )
+
+    def _format_queue_task(self, task: dict[str, Any]) -> str:
+        label = state_label(task["state"])
+        if task.get("transfer_mode") == "stream" and task["state"] in FAILED_STATES:
+            label = "流式传输失败"
+        text = (
+            f"任务编号：#{task['id']}｜{label}｜{format_bytes(task['file_size'])}\n"
+            f"文件名称：{truncate_display(str(task['file_name']))}"
+        )
+        progress = getattr(self, "_progress", {}).get(int(task["id"]))
+        if progress and task["state"] in {"downloading", "uploading", "streaming"}:
+            age = time.monotonic() - progress["at"]
+            speed = progress["speed"] if age <= 20 else 0
+            percent = min(100, 100 * progress["bytes"] / max(1, task["file_size"]))
+            text += f"\n传输进度：{percent:.1f}%｜{format_rate(speed)}"
+        elif task.get("wait_reason"):
+            text += f"\n等待原因：{truncate_display(str(task['wait_reason']))}"
+        return text
 
     def _format_task(self, task: dict[str, Any], verbose: bool = False) -> str:
         label = state_label(task["state"])
         if task.get("transfer_mode") == "stream" and task["state"] in FAILED_STATES:
             label = "流式传输失败；无完整本地副本，远端路径记录已保留"
         text = (
-            f"#{task['id']}｜{task['file_name']}\n"
-            f"大小：{format_bytes(task['file_size'])}\n"
-            f"状态：{label}"
+            "任务详情\n\n"
+            f"任务编号：#{task['id']}\n"
+            f"文件名称：{task['file_name']}\n"
+            f"文件大小：{format_bytes(task['file_size'])}\n"
+            f"当前状态：{label}"
         )
         reason = task.get("wait_reason")
         error = task.get("error")
         if reason:
             text += f"\n等待原因：{reason}"
         if error:
-            text += f"\n错误：{str(error)[:500]}"
-        if task.get("transfer_mode") == "stream":
-            text += "\n模式：流式传输（不占用本地任务额度）"
+            text += f"\n失败原因：{str(error)[:500]}"
+        text += (
+            "\n传输模式：流式传输（不占用本地任务额度）"
+            if task.get("transfer_mode") == "stream"
+            else "\n传输模式：普通落盘"
+        )
         progress = getattr(self, "_progress", {}).get(int(task["id"]))
         if progress and task["state"] in {"downloading", "uploading", "streaming"}:
             age = time.monotonic() - progress["at"]
             speed = progress["speed"] if age <= 20 else 0
-            label = (
-                "管道送入（非远端确认）"
-                if progress["stage"] == "stream"
-                else "本阶段传输"
-            )
             percent = min(100, 100 * progress["bytes"] / max(1, task["file_size"]))
             text += (
-                f"\n{label}：{percent:.1f}%｜{format_bytes(speed)}/s"
-                f"｜耗时 {int(time.monotonic() - progress['started'])} 秒"
+                f"\n传输进度：{percent:.1f}%｜{format_rate(speed)}"
+                f"\n已经耗时：{int(time.monotonic() - progress['started'])} 秒"
             )
         if verbose:
             text += (
-                f"\n已下载：{format_bytes(task['downloaded_bytes'])}"
-                f"\n下载重试：{task['download_retries']}"
-                f"\n上传重试：{task['upload_retries']}"
+                f"\n已经下载：{format_bytes(task['downloaded_bytes'])}"
+                f"\n重试次数：下载 {task['download_retries']}，上传 {task['upload_retries']}"
             )
             if task.get("remote_path"):
-                text += f"\nCloudDrive2 路径：{task['remote_path']}"
-            if task["state"] == "completed":
-                text += (
-                    "\n115 核验：Bot 无法自动判断；人工记录是可选的，"
-                    f"可发送 /confirm #{task['id']}，或集中核验后发送 /confirm all"
-                )
-            elif task["state"] == "confirmed":
-                text += "\n115 核验：已由你在官方客户端人工确认"
+                text += f"\n远端路径：{task['remote_path']}"
             if hasattr(self.db, "events"):
                 history = self.db.events(int(task["id"]), limit=4)
                 if history:
-                    text += "\n最近状态：" + " → ".join(
+                    text += "\n状态记录：" + " → ".join(
                         state_label(row["new_state"])
                         for row in reversed(history)
                     )
@@ -523,47 +1101,49 @@ class CommandMixin:
 
     def _format_status(self) -> str:
         counts = self.db.counts()
-        counts_text = "、".join(
-            f"{state_label(state)} {count}"
-            for state, count in sorted(counts.items())
-        ) or "无"
+        counts_text = format_status_counts(counts)
         used = self.db.used_local_bytes()
         snapshot = self.snapshot
-        resource_text = "资源采样尚未完成"
+        disk_text = "等待资源采样"
+        resource_text = "等待资源采样"
+        network_text = "等待资源采样"
         if snapshot:
+            disk_text = format_bytes(snapshot.disk_free)
             resource_text = (
-                f"CPU 平均：{snapshot.cpu_percent:.1f}%\n"
-                f"可用内存：{format_bytes(snapshot.memory_available)}\n"
-                f"磁盘可用：{format_bytes(snapshot.disk_free)}\n"
-                f"网络总速率：{format_bytes(snapshot.network_bytes_per_second)}/s"
+                f"CPU {snapshot.cpu_percent:.1f}%，"
+                f"内存 {format_bytes(snapshot.memory_available)}"
             )
+            network_text = f"{format_bytes(snapshot.network_bytes_per_second)}/s"
+        checked_age = (
+            f"{int(max(0, time.time() - self.destination_last_checked))} 秒前"
+            if self.destination_last_checked
+            else "尚未检查"
+        )
         if self._destination_ready():
             scope = getattr(self, "destination_scope", "unknown")
             if scope == "target":
-                destination_text = "目标目录可访问（未验证写入）"
+                destination_text = f"目标目录可访问（只读检查，{checked_age}）"
             elif scope == "root_fallback":
-                destination_text = "WebDAV 根目录可访问；目标目录尚未创建（未验证写入）"
+                destination_text = f"根目录可访问，目标目录未创建（{checked_age}）"
             elif scope == "root":
-                destination_text = "WebDAV 根目录可访问（未验证写入）"
+                destination_text = f"WebDAV 根目录可访问（只读检查，{checked_age}）"
             else:
-                destination_text = "目录可访问，探测范围未知（未验证写入）"
+                destination_text = f"目录可访问，范围未知（只读检查，{checked_age}）"
         else:
-            destination_text = "不可用、检查过期或未配置完成"
+            destination_text = f"不可用、检查过期或配置未完成（{checked_age}）"
         return (
-            "系统状态\n"
-            f"CloudDrive2 WebDAV：{destination_text}\n"
-            f"目录检查距今：{int(max(0, time.time() - self.destination_last_checked)) if self.destination_last_checked else '尚未完成'} 秒\n"
+            "系统状态\n\n"
+            f"目的状态：{destination_text}\n"
             f"队列调度：{'已暂停' if self.db.is_paused() else '运行中'}\n"
-            "115 官方端：Bot 不自动判断；如需记录，可用 /confirm <编号|all>\n"
-            f"Bot 当前实际传输：下载/流式 {len(self.download_tasks)}，"
-            f"落盘后上传 {len(self.upload_tasks)}\n"
-            f"下载动态窗口：{self.download_window.value}\n"
-            f"上传动态窗口：{self.upload_window.value}\n"
-            f"本地额度：{format_bytes(used)} / {format_bytes(self.settings.local_budget_bytes)}\n"
-            f"{resource_text}\n"
-            f"Telegram 落盘下载：{format_bytes(self._stage_rate('download'))}/s\n"
-            f"WebDAV 上传：{format_bytes(self._stage_rate('upload'))}/s\n"
-            f"流式管道送入：{format_bytes(self._stage_rate('stream'))}/s（非远端确认）\n"
+            f"当前传输：下载/流式 {len(self.download_tasks)}，上传 {len(self.upload_tasks)}\n"
+            f"并发窗口：下载 {self.download_window.value}，上传 {self.upload_window.value}\n"
+            f"本地额度：已用 {format_bytes(used)} / {format_bytes(self.settings.local_budget_bytes)}\n"
+            f"磁盘可用：{disk_text}\n"
+            f"资源使用：{resource_text}\n"
+            f"网络总速：{network_text}\n"
+            f"来源下载：Telegram {format_rate(self._stage_rate('download'))}\n"
+            f"远端上传：WebDAV {format_rate(self._stage_rate('upload'))}\n"
+            f"流式送入：{format_rate(self._stage_rate('stream'))}\n"
             f"任务统计：{counts_text}"
         )
 
@@ -571,12 +1151,12 @@ class CommandMixin:
         checked = self.destination_last_checked
         age = f"{max(0, int(time.time() - checked))} 秒前" if checked else "尚未完成"
         return (
-            "只读诊断（使用本进程采样，不创建远端测试文件）\n"
-            f"资源采样：{'新鲜' if self._sample_fresh() else '过期或未就绪；停止放行'}\n"
-            f"远端目录检查：{age}\n"
-            f"目的端：{'可访问' if self._destination_ready() else '未就绪或检查已过期'}\n"
+            "运行诊断\n\n"
+            f"资源采样：{'正常' if self._sample_fresh() else '过期或未就绪，停止放行'}\n"
+            f"检查时间：{age}\n"
+            f"目的目录：{'可以访问（只读检查）' if self._destination_ready() else '未就绪或检查已过期'}\n"
             f"检查说明：{self.destination_error or '目录探测通过，不代表可写'}\n"
-            f"下载窗口：{self.download_window.value}，上传窗口：{self.upload_window.value}\n"
-            "写入、改名和删除权限请主动执行 manage.sh verify 验收。\n"
-            "115 官方端仍需人工确认；敏感配置不会显示在此处。"
+            f"并发窗口：下载 {self.download_window.value}，上传 {self.upload_window.value}\n"
+            "写入验收：请主动执行 manage.sh verify\n"
+            "敏感信息：不会在诊断结果中显示"
         )

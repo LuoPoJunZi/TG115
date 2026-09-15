@@ -3,16 +3,21 @@ from __future__ import annotations
 # The tests insert the packaged payload path before importing the app.
 import asyncio
 import base64
+import http.server
 import os
+import socket
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from collections import deque
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+
+import paramiko
 
 SOURCE = Path(__file__).resolve().parents[1]
 PAYLOAD = SOURCE / "payload"
@@ -33,6 +38,7 @@ from installer import (
     APP_VERSION,
     MANAGED_CD2_WEBDAV_URL,
     InstallerApp,
+    Tunnel,
     b64,
     packaged_self_test,
     re_safe_remote_stage,
@@ -121,6 +127,98 @@ def sample_vps_resources(
 
 
 class InstallerHelpersTests(unittest.TestCase):
+    def test_tunnel_probe_forwards_a_real_http_response(self) -> None:
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                body = b"tg115-tunnel-ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_: object) -> None:
+                return
+
+        origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        origin_thread = threading.Thread(target=origin.serve_forever, daemon=True)
+        origin_thread.start()
+
+        class Transport:
+            @staticmethod
+            def open_channel(*_: object, **__: object) -> socket.socket:
+                return socket.create_connection(origin.server_address, timeout=2)
+
+        session = SimpleNamespace(
+            client=SimpleNamespace(get_transport=lambda: Transport()), close=Mock()
+        )
+        tunnel = Tunnel(session, local_port=0)
+        tunnel.start()
+        try:
+            tunnel.probe(timeout=2)
+        finally:
+            tunnel.close()
+            origin.shutdown()
+            origin.server_close()
+        session.close.assert_called_once()
+
+    def test_tunnel_probe_explains_when_ssh_forwarding_is_denied(self) -> None:
+        transport = Mock()
+        transport.open_channel.side_effect = paramiko.ChannelException(
+            1, "Administratively prohibited"
+        )
+        session = SimpleNamespace(
+            client=SimpleNamespace(get_transport=lambda: transport), close=Mock()
+        )
+        tunnel = Tunnel(session, local_port=0)
+        tunnel.start()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "SSH 服务禁止 TCP 端口转发"):
+                tunnel.probe(timeout=2)
+        finally:
+            tunnel.close()
+
+    def test_open_clouddrive_rebuilds_a_stale_tunnel_before_opening(self) -> None:
+        app = InstallerApp.__new__(InstallerApp)
+        app._snapshot = Mock(return_value=valid_installer_values())
+        app._validate = Mock()
+        app._run_worker = lambda action: action()
+        app._log = Mock()
+        app.root = Mock()
+        stale = Mock()
+        stale.probe.side_effect = RuntimeError("stale tunnel")
+        app.tunnel = stale
+        session = Mock()
+        session.run.return_value = (0, "")
+        app._new_session = Mock(return_value=session)
+        replacement = Mock()
+        replacement.url = "http://127.0.0.1:19798"
+
+        with (
+            patch("installer.Tunnel", return_value=replacement),
+            patch("installer.webbrowser.open") as browser_open,
+        ):
+            app.open_clouddrive()
+
+        stale.close.assert_called_once()
+        replacement.start.assert_called_once()
+        replacement.probe.assert_called_once()
+        browser_open.assert_called_once_with(replacement.url)
+        self.assertIs(app.tunnel, replacement)
+
+    def test_tunnel_does_not_fall_back_when_local_port_is_occupied(self) -> None:
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        occupied_port = listener.getsockname()[1]
+        session = SimpleNamespace(
+            client=SimpleNamespace(get_transport=lambda: Mock()), close=Mock()
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "关闭占用该端口的程序"):
+                Tunnel(session, local_port=occupied_port)
+        finally:
+            listener.close()
+
     def test_packaged_self_test_rejects_broken_tk(self) -> None:
         import tkinter as tk
 
@@ -525,7 +623,10 @@ class StatusTextTests(unittest.TestCase):
             state_label("completed"),
             "Bot 传输已完成（CloudDrive2 已接收）",
         )
-        self.assertEqual(state_label("confirmed"), "115 官方端已由你确认")
+        self.assertEqual(
+            state_label("confirmed"),
+            "Bot 传输已完成（CloudDrive2 已接收）",
+        )
         self.assertNotIn("正在上传", state_label("completed"))
         self.assertNotIn("后台处理中", state_label("completed"))
 
