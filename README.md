@@ -73,10 +73,10 @@ TG115 的定位是“手动选择、自动处理”：你在 Telegram 中挑选�
 
 ## 当前版本
 
-当前正式版为 `v1.6.0`。本地完整回归与 GitHub Actions 已通过；真实 VPS、Telegram、
+当前正式版为 `v1.6.1`。本地完整回归与 GitHub Actions 已通过；真实 VPS、Telegram、
 CloudDrive2 和 115 仍应在部署后按验收记录分层核对。
 
-详细改动和验证边界见 [v1.6.0 优化与验收记录](docs/v1.6.0-优化与验收.md)。
+详细改动和验证边界见 [v1.6.1 更新与验收记录](docs/v1.6.1-更新与验收.md)。
 
 ## 部署前准备
 
@@ -580,6 +580,7 @@ Windows 上构建部署器和执行打包后自检。贡献前请阅读 [CONTRIB
 
 - [小白使用说明](docs/README-小白使用说明.md)
 - [部署前填写信息清单](docs/填写信息清单.md)
+- [v1.6.1 更新与验收记录](docs/v1.6.1-更新与验收.md)
 - [v1.6.0 优化与验收记录](docs/v1.6.0-优化与验收.md)
 - [验收与复核报告](docs/验收与复核报告.md)
 - [第三方组件说明](docs/第三方组件说明.md)
@@ -592,7 +593,7 @@ Windows 上构建部署器和执行打包后自检。贡献前请阅读 [CONTRIB
 
 - 原始项目仓库：[whyhhh20/TG115](https://github.com/whyhhh20/TG115)
 
-本仓库的 v1.6.0 二次开发以原项目 v1.5.0 代码为基础，保留 MIT 许可证，并在原有
+本仓库的 v1.6.x 二次开发以原项目 v1.5.0 代码为基础，保留 MIT 许可证，并在原有
 Telegram → rclone → CloudDrive2 → 115 链路上继续完善可靠性、部署安全和运维体验。
 
 同时感谢 Telethon、rclone、Docker、Paramiko 等开源项目，以及 CloudDrive2 提供的 WebDAV

@@ -38,7 +38,7 @@ from vps_resources import (
 )
 
 APP_TITLE = "Telegram → 115 一键部署器"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 MANAGED_CD2_WEBDAV_URL = "http://clouddrive2:19798/dav"
 
 
