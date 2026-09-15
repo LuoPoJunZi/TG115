@@ -433,6 +433,31 @@ CloudDrive2 WebDAV，并完成远端大小校验和本地清理；它不是“�
 
 检查 IP、SSH 端口、用户名、密码或私钥；同时检查 VPS 服务商的安全组是否放行 SSH 端口。
 
+如果提示 `Host key for server ... does not match`，不是密码填错，而是本机保存的旧 SSH 主机
+密钥与当前服务器不一致。VPS 重装、恢复快照、重新生成 SSH 密钥或 IP 被重新分配后可能出现；
+如果没有这些变化，先停止操作并通过服务商控制台确认服务器身份。
+
+已经确认密钥变化符合预期时：
+
+1. 从 VPS 服务商网页控制台执行以下命令，记录当前 `SHA256:...` 指纹：
+
+   ```bash
+   sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
+   sudo ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub -E sha256
+   ```
+
+2. 关闭部署器，在 Windows PowerShell 中打开记录文件：
+
+   ```powershell
+   notepad "$env:APPDATA\TG115-Deployer\known_hosts"
+   ```
+
+3. 只删除当前 VPS 对应的一行。非默认 SSH 端口的行通常以 `[主机名或IP]:端口` 开头；不要
+   清空整个文件。
+4. 重新测试 SSH，将新弹窗的密钥类型和 SHA-256 指纹与服务商控制台结果核对，一致后再接受。
+
+不要把真实 IP、主机公钥、VPS 密码或私钥发布到 Issue、日志截图或聊天记录中。
+
 ### 部署器被安全软件提示
 
 单文件 EXE 由 PyInstaller 打包，部分安全软件会对未签名的自解压程序作启发式提示。请核对

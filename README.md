@@ -388,6 +388,33 @@ sudo /opt/tg115/manage.sh verify
 检查 VPS 地址、端口、用户名、密码或私钥，以及服务商安全组。首次连接应核对主机密钥指纹，
 不要在指纹变化原因不明时直接接受。
 
+如果提示 `Host key for server ... does not match`，表示部署器保存的旧 SSH 主机密钥与服务器
+本次返回的密钥不同。这不是用户名或密码错误，常见于 VPS 重装、恢复快照、SSH 主机密钥
+重新生成或 IP 被重新分配；原因不明时也可能存在连接到错误服务器或中间人攻击的风险。
+
+确认 VPS 确实发生过上述变化后，按以下步骤更新记录：
+
+1. 优先从服务商网页控制台／VNC 登录 VPS，查看当前 SSH 主机指纹：
+
+   ```bash
+   sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub -E sha256
+   sudo ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub -E sha256
+   ```
+
+2. 关闭部署器，在 Windows PowerShell 中打开部署器自己的主机记录：
+
+   ```powershell
+   notepad "$env:APPDATA\TG115-Deployer\known_hosts"
+   ```
+
+3. 只删除当前 VPS 对应的一行并保存。默认 22 端口通常以主机名或 IP 开头；非默认端口通常以
+   `[主机名或IP]:端口` 开头。不要清空整个文件，也不要删除其他 VPS 的记录。
+4. 重新打开部署器并点击“测试 SSH”。首次密钥确认框再次出现后，将其中的密钥类型和
+   `SHA256:...` 指纹与第 1 步核对，完全一致才接受。
+
+如果 VPS 没有重装、换机、恢复快照或调整 SSH 配置，不要直接删除旧记录，应先在服务商控制台
+确认当前 IP 和服务器身份。不要把错误窗口中的真实 IP、主机公钥或登录资料提交到 Issue。
+
 ### 提示没有 `/dev/fuse`
 
 受管 CloudDrive2 Docker 挂载需要 FUSE。请在 VPS 控制台开启，或联系服务商确认虚拟化类型
