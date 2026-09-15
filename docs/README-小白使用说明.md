@@ -1,6 +1,6 @@
 # Telegram → 115 一键部署器：小白使用说明
 
-> 公开正式版：1.5.0；本地开发版：1.6.0；适用电脑：Windows 10 / Windows 11 64 位；适用 VPS：Ubuntu 或
+> 公开正式版：1.6.0；适用电脑：Windows 10 / Windows 11 64 位；适用 VPS：Ubuntu 或
 > Debian 64 位；推荐 VPS：2 核 CPU、4GB 内存、50GB 硬盘。
 
 ---

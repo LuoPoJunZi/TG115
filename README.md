@@ -76,8 +76,8 @@ TG115 的定位是“手动选择、自动处理”：你在 Telegram 中挑选�
 
 ## 当前版本
 
-当前代码版本为 `v1.6.0` 候选版。正式 GitHub Release 和 `v1.6.0` 标签应在真实 VPS、
-Telegram、CloudDrive2 和 115 分层验收通过后发布。
+当前正式版为 `v1.6.0`。本地完整回归与 GitHub Actions 已通过；真实 VPS、Telegram、
+CloudDrive2 和 115 仍应在部署后按验收记录分层核对。
 
 详细改动和验证边界见 [v1.6.0 优化与验收记录](docs/v1.6.0-优化与验收.md)。
 
@@ -124,8 +124,8 @@ CloudDrive2 / 115：
 
 ### 1. 获取并校验部署器
 
-正式版本优先从本仓库的 GitHub Releases 下载 EXE 和 `SHA256SUMS.txt`。如果当前版本尚未发布，
-可在 Windows PowerShell 中从源码构建：
+正式版本优先从本仓库的 [GitHub Releases](https://github.com/LuoPoJunZi/TG115/releases) 下载
+EXE 和 `SHA256SUMS.txt`。也可在 Windows PowerShell 中从源码构建：
 
 ```powershell
 git clone https://github.com/LuoPoJunZi/TG115.git
