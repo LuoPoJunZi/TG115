@@ -28,9 +28,10 @@ class DeploymentShellTests(unittest.TestCase):
     ) -> subprocess.CompletedProcess[bytes]:
         command = (
             'source "$1"; '
+            'backup_dir="$(cd "$2" && pwd -P)" || exit 1; '
             'if [[ "$3" == inventory ]]; then '
-            'tg115_backup_inventory "$2"; '
-            'else tg115_prune_backups "$2" "$4"; fi'
+            'tg115_backup_inventory "$backup_dir"; '
+            'else tg115_prune_backups "$backup_dir" "$4"; fi'
         )
         return subprocess.run(
             [
