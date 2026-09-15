@@ -439,6 +439,11 @@ uv run --with pip-audit==2.10.1 pip-audit -r requirements-build.txt
 CI 还会在 Linux 上运行 ShellCheck、Compose 配置校验、Python 3.12 回归和 Bot 镜像构建，并在
 Windows 上构建部署器和执行打包后自检。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+如果仓库由 GitHub Fork 创建，首次使用时需进入仓库的 **Actions** 页面，按提示启用工作流。
+本仓库同时支持 `main` 推送、Pull Request 和页面中的 “Run workflow” 手动触发。GitHub 默认
+不会在新 Fork 中自动运行工作流，详见
+[GitHub 官方说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories)。
+
 ## 更多文档
 
 - [小白使用说明](docs/README-小白使用说明.md)
