@@ -630,20 +630,24 @@ class QueueAndResourceSimulationTests(unittest.TestCase):
                 )
                 service.destination_healthy = True
                 service.download_window = SimpleNamespace(value=5)
+                service._sample_fresh = Mock(return_value=True)  # type: ignore[method-assign]
+                service._destination_ready = Mock(return_value=True)  # type: ignore[method-assign]
 
                 async def hold(_: int) -> None:
                     await asyncio.Event().wait()
 
                 service._download_one = hold  # type: ignore[method-assign]
-                await service._start_downloads()
-                self.assertEqual(sorted(service.download_tasks), list(range(201, 206)))
-                for running in service.download_tasks.values():
-                    running.cancel()
-                await asyncio.gather(
-                    *service.download_tasks.values(),
-                    return_exceptions=True,
-                )
-                db.close()
+                try:
+                    await service._start_downloads()
+                    self.assertEqual(
+                        sorted(service.download_tasks), list(range(201, 206))
+                    )
+                finally:
+                    running_tasks = list(service.download_tasks.values())
+                    for running in running_tasks:
+                        running.cancel()
+                    await asyncio.gather(*running_tasks, return_exceptions=True)
+                    db.close()
 
         asyncio.run(scenario())
 
