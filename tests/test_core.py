@@ -35,12 +35,12 @@ from app.rclone_client import RcloneClient, RcloneError
 from app.resources import AdaptiveWindow, ResourceSnapshot
 from app.verify_destination import verify_destination
 
+import installer as modern_installer
 from installer import (
     APP_VERSION,
     DEFAULTS,
     MANAGED_CD2_WEBDAV_URL,
     InstallerBackend,
-    InstallerWindow,
     Redactor,
     RemoteSession,
     Tunnel,
@@ -144,9 +144,13 @@ def sample_vps_resources(
 
 
 class InstallerHelpersTests(unittest.TestCase):
+    @unittest.skipUnless(
+        getattr(modern_installer, "InstallerWindow", None) is not None,
+        "Modern Qt GUI runtime is unavailable on this platform",
+    )
     def test_qt_preview_exposes_the_complete_configuration_contract(self) -> None:
         app = make_app()
-        window = InstallerWindow(preview=True)
+        window = modern_installer.InstallerWindow(preview=True)
         try:
             self.assertEqual(window.snapshot(), DEFAULTS)
             window.auth_group.button(1).click()
@@ -301,7 +305,9 @@ class InstallerHelpersTests(unittest.TestCase):
             window.snapshot.return_value = dict(DEFAULTS)
             with (
                 patch("installer.make_app", return_value=app),
-                patch("installer.InstallerWindow", return_value=window) as window_class,
+                patch(
+                    "installer.InstallerWindow", return_value=window, create=True
+                ) as window_class,
                 patch(
                     "installer.dependency_report",
                     return_value={
