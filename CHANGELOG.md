@@ -8,6 +8,8 @@
   软件的 ICU 运行库被误打包后导致 QtCore 无法启动。
 - Windows 构建新增 Modern／Classic 双版本：Modern 使用 PySide6 新界面，Classic 保留原
   Tkinter 界面；`build.ps1 -Edition All|Modern|Classic` 可选择构建范围，CI 分别自检两个成品。
+- Linux CI 显式使用 Qt offscreen 平台运行 Modern 界面回归，避免无头 Runner 中残留的显示环境
+  变量触发不可用的桌面平台插件。
 - Bot 改用 Telegram 输入框左侧的原生命令菜单，7 项菜单说明统一为 6 个中文字符；新回复不再
   附带消息下方快捷按钮，队列翻页和带参数任务操作继续使用文字命令；菜单注册失败不阻止服务启动。
 - 系统状态的目的端可访问文案移除“只读检查”和检查时间后缀，后台探测与过期保护逻辑不变。

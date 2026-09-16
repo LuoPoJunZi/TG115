@@ -30,7 +30,7 @@ GitHub 下载新代码。
 
 ## 验证边界
 
-发布提交前完成 173 项 Python 回归且无跳过，其中包括 4 项真实本地 rclone WebDAV 集成；
+发布提交前完成 174 项 Python 回归且无跳过，其中包括 4 项真实本地 rclone WebDAV 集成；
 Ruff、Bandit、两份依赖审计，以及 Modern、Classic 两个 Windows EXE 的打包后自检均通过。
 GitHub Actions 会在推送后运行；自动化结果不能替代真实 VPS、Telegram、CloudDrive2 与
 115 官方端的分层验收。

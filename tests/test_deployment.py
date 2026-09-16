@@ -148,6 +148,13 @@ class DeploymentShellTests(unittest.TestCase):
 
 
 class DeploymentStructureTests(unittest.TestCase):
+    def test_linux_ci_runs_qt_tests_with_offscreen_platform(self) -> None:
+        workflow = (SOURCE / ".github" / "workflows" / "tests.yml").read_text(
+            encoding="utf-8"
+        )
+        linux_job = workflow.split("  linux-payload:", 1)[1]
+        self.assertIn("QT_QPA_PLATFORM: offscreen", linux_job)
+
     def test_windows_build_isolates_dll_dependency_search_path(self) -> None:
         script = (SOURCE / "build.ps1").read_text(encoding="utf-8")
         self.assertIn("function Get-Tg115IsolatedPath", script)
