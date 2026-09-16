@@ -18,3 +18,6 @@ uv run --with-requirements requirements-build.txt `
 Shell 故障回归需要 Bash（Windows 可通过 `TG115_TEST_BASH` 指定 Git Bash 的绝对路径）。
 Linux CI 安装两者并使用 Python 3.12 运行全部测试，Windows 使用 Python 3.13。
 测试只创建本机临时文件、模拟配置和回环 WebDAV 服务，不使用个人凭据或联系真实 VPS。
+
+修改 Windows 部署器公共行为或版本号时，要同时检查 `installer.py` 和
+`installer_classic.py`；运行 `.\build.ps1` 会构建并自检 Modern、Classic 两个版本。

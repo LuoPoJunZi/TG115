@@ -73,10 +73,10 @@ TG115 的定位是“手动选择、自动处理”：你在 Telegram 中挑选�
 
 ## 当前版本
 
-当前正式版为 `v1.6.1`。本地完整回归与 GitHub Actions 已通过；真实 VPS、Telegram、
-CloudDrive2 和 115 仍应在部署后按验收记录分层核对。
+当前源码版本为 `v1.6.2`。本地完整回归已通过；GitHub Actions 会在本次推送后运行，真实 VPS、
+Telegram、CloudDrive2 和 115 仍应在部署后按验收记录分层核对。
 
-详细改动和验证边界见 [v1.6.1 更新与验收记录](docs/v1.6.1-更新与验收.md)。
+详细改动和验证边界见 [v1.6.2 更新与验收记录](docs/v1.6.2-更新与验收.md)。
 
 ## 部署前准备
 
@@ -130,11 +130,27 @@ cd TG115
 .\build.ps1
 ```
 
+默认同时构建两个版本，也可以只构建其中一个：
+
+```powershell
+.\build.ps1 -Edition All
+.\build.ps1 -Edition Modern
+.\build.ps1 -Edition Classic
+```
+
 构建结果位于：
 
 ```text
-dist/TG115-Deployer.exe
+dist/TG115-Deployer-Modern.exe
+dist/TG115-Deployer-Classic.exe
 ```
+
+`Modern` 使用锁定版本的 PySide6 和新版界面，是推荐版本；`Classic` 保留替换前的 Tkinter
+界面，体积更小，作为低配置或偏好原界面的兼容版本。双击启动脚本时会优先打开 Modern，找不到
+Modern 才回退到 Classic 或旧文件名。Classic 保留原有交互，不承诺同步后续界面功能。
+
+`build.ps1` 会按照 `requirements-build.txt` 自动准备依赖，分别验证 Qt/Tk GUI 运行时，并在
+打包时隔离第三方 DLL 搜索路径，避免构建机上其他软件的运行库污染成品。
 
 运行部署器前应核对 Release 提供的 SHA-256；未签名的 PyInstaller 单文件程序可能触发部分
 安全软件的启发式提示。
@@ -335,37 +351,27 @@ CloudDrive2 和 115 配置完成后，点击“WebDAV 验收”。该操作会�
 | `/orphans` | 只读巡检疑似遗留的 `.uploading-*` 临时文件 |
 | `/orphans clean` | 获取一次性确认码后显式清理遗留临时文件 |
 
-### 单页快捷菜单
+### Telegram 原生命令菜单
 
-发送 `/start` 或 `/help` 会显示一张四字标签对齐的帮助页，并附带快捷按钮：
+Bot 启动时会自动注册 Telegram 输入框左侧的原生命令菜单，7 项说明统一使用 6 个中文字符：
 
 ```text
-使用帮助
-
-提交文件：直接发送或转发视频、文档等文件
-状态查看：/status、/queue [页码]
-任务查看：/task <编号>
-进度跟踪：/watch <编号>
-失败重试：/retry <编号|all>
-取消任务：/cancel <编号>
-流式传输：/stream <编号>
-调度控制：/pause、/resume
-运行诊断：/doctor
-临时巡检：/orphans
-
-[系统状态] [最近任务]
-[暂停调度] [恢复调度]
-[运行诊断] [临时巡检]
+/status   查看系统状态
+/queue    查看最近任务
+/pause    暂停任务调度
+/resume   恢复任务调度
+/doctor   运行系统诊断
+/orphans  检查临时文件
+/help     查看使用帮助
 ```
 
-按钮会编辑当前菜单消息，减少会话刷屏；文字命令全部保留。按钮回调再次校验配置用户 ID 和
-私聊会话，转发到群组或由其他账号点击都不能执行操作。
+新回复只显示文字，不在消息下方附加 Telegram 按钮。点击原生命令菜单会发送对应命令；完整
+参数命令仍可手动输入。`/queue` 默认每页显示 5 项，使用 `/queue 2`、`/queue 3` 翻页；查看、
+重试、切换流式和取消任务分别使用 `/task <编号>`、`/retry <编号>`、`/stream <编号>` 和
+`/cancel <编号>`。取消继续遵守远端先删除并复查、再删除本地副本的失败关闭规则。
 
-`/queue` 默认每页显示 5 项，长文件名按显示宽度截断，下方可以直接上一页、下一页或查看某个
-任务。任务详情提供“刷新进度”“重新排队”“切换流式”“取消任务”等适用于当前状态的按钮。
-按钮取消不会立刻删除内容：Bot 会先展示影响说明，只有在 5 分钟内再次点击“确认取消”才执行；
-远端无法确认安全删除时仍会失败关闭并保留本地数据。明确输入 `/cancel <编号>` 的旧流程保持
-兼容。快捷“临时巡检”始终只读；真正清理仍需使用 `/orphans clean` 取得一次性确认码。
+菜单注册失败不会阻止 Bot 启动，仍可直接输入全部文字命令；启动日志会记录失败原因。升级前
+已经存在的旧快捷按钮消息仅为兼容保留，不会出现在新的 Bot 回复中。
 
 `/status` 和 `/performance` 返回同一份完整单页信息。字段统一使用四字标签，避免 Telegram
 客户端在不同位置自动折行；任务统计只显示数量不为零的分类，并把历史兼容终态统一计入
@@ -374,7 +380,7 @@ CloudDrive2 和 115 配置完成后，点击“WebDAV 验收”。该操作会�
 ```text
 系统状态
 
-目的状态：目标目录可访问（只读检查，4 秒前）
+目的状态：目标目录可访问
 队列调度：运行中
 当前传输：下载/流式 1，上传 0
 并发窗口：下载 4，上传 1
@@ -541,7 +547,8 @@ Docker 数据目录可能和 `/opt/tg115` 位于不同文件系统。部署器�
 ### 项目结构
 
 ```text
-installer.py                 Windows Tkinter 部署器
+installer.py                 Windows PySide6 部署器及 SSH/部署后端
+installer_classic.py         原 Tkinter 界面的轻量兼容部署器
 vps_resources.py             VPS 资源探测和实例建议
 payload/app/main.py          Bot 调度及普通/流式传输状态机
 payload/app/db.py            SQLite 队列、额度和恢复
@@ -562,14 +569,15 @@ uv run --with-requirements requirements-build.txt `
 ### 静态和依赖检查
 
 ```powershell
-uv run --with ruff==0.16.0 ruff check installer.py vps_resources.py payload/app tests
-uv run --with bandit==1.9.4 bandit -q -r payload/app installer.py vps_resources.py
+uv run --with ruff==0.16.0 ruff check installer.py installer_classic.py vps_resources.py payload/app tests
+uv run --with bandit==1.9.4 bandit -q -r payload/app installer.py installer_classic.py vps_resources.py
 uv run --with pip-audit==2.10.1 pip-audit -r payload/requirements.txt
 uv run --with pip-audit==2.10.1 pip-audit -r requirements-build.txt
 ```
 
 CI 还会在 Linux 上运行 ShellCheck、Compose 配置校验、Python 3.12 回归和 Bot 镜像构建，并在
-Windows 上构建部署器和执行打包后自检。贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+Windows 上构建 Modern、Classic 两个部署器并分别执行打包后自检。贡献前请阅读
+[CONTRIBUTING.md](CONTRIBUTING.md)。
 
 如果仓库由 GitHub Fork 创建，首次使用时需进入仓库的 **Actions** 页面，按提示启用工作流。
 本仓库同时支持 `main` 推送、Pull Request 和页面中的 “Run workflow” 手动触发。GitHub 默认
@@ -580,6 +588,7 @@ Windows 上构建部署器和执行打包后自检。贡献前请阅读 [CONTRIB
 
 - [小白使用说明](docs/README-小白使用说明.md)
 - [部署前填写信息清单](docs/填写信息清单.md)
+- [v1.6.2 更新与验收记录](docs/v1.6.2-更新与验收.md)
 - [v1.6.1 更新与验收记录](docs/v1.6.1-更新与验收.md)
 - [v1.6.0 优化与验收记录](docs/v1.6.0-优化与验收.md)
 - [验收与复核报告](docs/验收与复核报告.md)

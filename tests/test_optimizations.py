@@ -15,10 +15,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from telethon.tl import functions, types
+
 SOURCE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE / "payload"))
 
-from app.bot_commands import truncate_display
+from app.bot_commands import BOT_MENU_COMMANDS, truncate_display
 from app.db import SCHEMA_VERSION, TaskDB
 from app.deployment_check import code_fingerprint, mismatched_keys
 from app.healthcheck import healthy
@@ -88,26 +90,56 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/confirm", text)
         self.assertNotIn("人工确认", text)
 
-    async def test_help_uses_aligned_labels_and_main_shortcuts(self) -> None:
+    async def test_help_uses_aligned_labels_without_inline_buttons(self) -> None:
         event = SimpleNamespace(reply=AsyncMock())
         await self.service._handle_command(event, "/help")
         text = event.reply.await_args.args[0]
         for line in text.splitlines():
             if "：" in line:
                 self.assertEqual(len(line.split("：", 1)[0]), 4, line)
-        buttons = event.reply.await_args.kwargs["buttons"]
-        data = {button.data for row in buttons for button in row}
+        self.assertNotIn("buttons", event.reply.await_args.kwargs)
+
+    async def test_native_menu_uses_equal_length_descriptions(self) -> None:
+        requests = []
+
+        class FakeClient:
+            async def __call__(self, request):
+                requests.append(request)
+
+        self.service.client = FakeClient()
+        await self.service._register_bot_menu()
+
+        self.assertEqual({len(description) for _, description in BOT_MENU_COMMANDS}, {6})
         self.assertEqual(
-            data,
-            {
-                b"menu:status",
-                b"queue:1",
-                b"control:pause",
-                b"control:resume",
-                b"menu:doctor",
-                b"menu:orphans",
-            },
+            BOT_MENU_COMMANDS,
+            (
+                ("status", "查看系统状态"),
+                ("queue", "查看最近任务"),
+                ("pause", "暂停任务调度"),
+                ("resume", "恢复任务调度"),
+                ("doctor", "运行系统诊断"),
+                ("orphans", "检查临时文件"),
+                ("help", "查看使用帮助"),
+            ),
         )
+        self.assertEqual(len(requests), 2)
+        self.assertIsInstance(requests[0], functions.bots.SetBotCommandsRequest)
+        self.assertIsInstance(requests[0].scope, types.BotCommandScopeDefault)
+        self.assertEqual(
+            [(command.command, command.description) for command in requests[0].commands],
+            list(BOT_MENU_COMMANDS),
+        )
+        self.assertIsInstance(requests[1], functions.bots.SetBotMenuButtonRequest)
+        self.assertIsInstance(requests[1].button, types.BotMenuButtonCommands)
+
+    async def test_native_menu_failure_does_not_block_service(self) -> None:
+        class FailingClient:
+            async def __call__(self, _request):
+                raise RuntimeError("simulated Telegram failure")
+
+        self.service.client = FailingClient()
+        await self.service._register_bot_menu()
+        self.service.log.warning.assert_called_once()
 
     async def test_queue_pages_are_compact_and_navigable(self) -> None:
         for message_id in range(1, 8):
@@ -119,26 +151,15 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("#7", first_text)
         self.assertIn("#3", first_text)
         self.assertNotIn("#2｜", first_text)
-        first_data = {
-            button.data
-            for row in first.reply.await_args.kwargs["buttons"]
-            for button in row
-        }
-        self.assertIn(b"queue:2", first_data)
+        self.assertNotIn("buttons", first.reply.await_args.kwargs)
 
-        second = SimpleNamespace(
-            sender_id=self.settings.allowed_user_id,
-            chat_id=self.settings.allowed_user_id,
-            data=b"queue:2",
-            answer=AsyncMock(),
-            edit=AsyncMock(),
-        )
-        await self.service._on_callback(second)
-        second_text = second.edit.await_args.args[0]
+        second = SimpleNamespace(reply=AsyncMock())
+        await self.service._handle_command(second, "/queue 2")
+        second_text = second.reply.await_args.args[0]
         self.assertIn("当前页码：第 2 页", second_text)
         self.assertIn("#2", second_text)
         self.assertIn("#1", second_text)
-        second.answer.assert_awaited_once_with()
+        self.assertNotIn("buttons", second.reply.await_args.kwargs)
 
     async def test_unauthorized_callback_cannot_pause_scheduler(self) -> None:
         event = SimpleNamespace(
@@ -308,7 +329,10 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不代表可写", text)
         self.assertNotIn(self.settings.cd2_password, text)
         self.assertEqual(self.service.rclone.files, {})
-        self.assertIn("只读检查", self.service._format_status())
+        self.service.destination_scope = "target"
+        status = self.service._format_status()
+        self.assertIn("目的状态：目标目录可访问", status)
+        self.assertNotIn("只读检查", status)
 
     async def test_cancel_before_move_cleans_both_recorded_paths(self) -> None:
         task = self.task(local=True)

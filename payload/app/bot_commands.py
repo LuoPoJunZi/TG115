@@ -9,6 +9,7 @@ from typing import Any
 
 from telethon import Button, events
 from telethon.errors import MessageNotModifiedError
+from telethon.tl import functions, types
 
 from .states import FAILED_STATES, STATE_LABELS
 
@@ -18,6 +19,15 @@ TASK_ACTION_TTL_SECONDS = 5 * 60
 QUEUE_PAGE_SIZE = 5
 MAX_QUEUE_PAGE = 10_000
 TERMINAL_TASK_STATES = {"completed", "confirmed", "cancelled"}
+BOT_MENU_COMMANDS = (
+    ("status", "查看系统状态"),
+    ("queue", "查看最近任务"),
+    ("pause", "暂停任务调度"),
+    ("resume", "恢复任务调度"),
+    ("doctor", "运行系统诊断"),
+    ("orphans", "检查临时文件"),
+    ("help", "查看使用帮助"),
+)
 
 
 def state_label(state: str) -> str:
@@ -91,6 +101,29 @@ def truncate_display(text: str, max_width: int = 32) -> str:
 class CommandMixin:
     """Telegram command routing and user-facing status rendering."""
 
+    async def _register_bot_menu(self) -> None:
+        """Install the native Telegram command menu without blocking startup."""
+        commands = [
+            types.BotCommand(command=command, description=description)
+            for command, description in BOT_MENU_COMMANDS
+        ]
+        try:
+            await self.client(
+                functions.bots.SetBotCommandsRequest(
+                    scope=types.BotCommandScopeDefault(),
+                    lang_code="",
+                    commands=commands,
+                )
+            )
+            await self.client(
+                functions.bots.SetBotMenuButtonRequest(
+                    user_id=types.InputUserEmpty(),
+                    button=types.BotMenuButtonCommands(),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - optional Telegram UI setup
+            self.log.warning("注册 Telegram 原生命令菜单失败：%s", exc)
+
     @staticmethod
     def _format_help() -> str:
         return (
@@ -104,7 +137,8 @@ class CommandMixin:
             "流式传输：/stream <编号>\n"
             "调度控制：/pause、/resume\n"
             "运行诊断：/doctor\n"
-            "临时巡检：/orphans"
+            "临时巡检：/orphans\n"
+            "快捷菜单：使用输入框左侧原生命令菜单"
         )
 
     @staticmethod
@@ -251,8 +285,8 @@ class CommandMixin:
         return rows
 
     async def _reply_queue(self, event: Any, page: int) -> None:
-        text, tasks, has_next = self._queue_page(page)
-        await event.reply(text, buttons=self._queue_buttons(page, tasks, has_next))
+        text, _, _ = self._queue_page(page)
+        await event.reply(text)
 
     async def _edit_callback(
         self, event: Any, text: str, buttons: list[list[Any]]
@@ -475,18 +509,15 @@ class CommandMixin:
         parts = text.split()
         command = parts[0].split("@", 1)[0].lower()
         if command in {"/start", "/help"}:
-            await event.reply(self._format_help(), buttons=self._main_buttons())
+            await event.reply(self._format_help())
         elif command == "/queue":
             page = self._parse_queue_page(parts)
             if page is None:
-                await event.reply(
-                    "使用说明\n\n正确格式：/queue [页码]",
-                    buttons=self._secondary_buttons(b"queue:1"),
-                )
+                await event.reply("使用说明\n\n正确格式：/queue [页码]")
             else:
                 await self._reply_queue(event, page)
         elif command in {"/status", "/performance"}:
-            await event.reply(self._format_status(), buttons=self._main_buttons())
+            await event.reply(self._format_status())
         elif command == "/task":
             await self._command_task(event, parts)
         elif command == "/watch":
@@ -510,14 +541,10 @@ class CommandMixin:
                         if command == "/pause"
                         else "新任务仍需满足目的端与资源安全条件"
                     ),
-                ),
-                buttons=self._main_buttons(),
+                )
             )
         elif command == "/doctor":
-            await event.reply(
-                self._format_doctor(),
-                buttons=self._secondary_buttons(b"menu:doctor"),
-            )
+            await event.reply(self._format_doctor())
         elif command == "/stream":
             await self._command_stream(event, parts)
         elif command == "/orphans":
@@ -546,14 +573,9 @@ class CommandMixin:
         task_id = self._parse_task_id(parts)
         task = self.db.get(task_id) if task_id else None
         if task is None:
-            await event.reply(
-                "使用说明\n\n正确格式：/task <任务编号>",
-                buttons=self._secondary_buttons(b"queue:1"),
-            )
+            await event.reply("使用说明\n\n正确格式：/task <任务编号>")
             return
-        await event.reply(
-            self._format_task(task, verbose=True), buttons=self._task_buttons(task)
-        )
+        await event.reply(self._format_task(task, verbose=True))
 
     async def _command_confirm(
         self, event: events.NewMessage.Event, parts: list[str]
@@ -611,8 +633,7 @@ class CommandMixin:
                     operation="切换流式传输",
                     note="已有完整本地文件，应保留可恢复上传能力",
                     task=task,
-                ),
-                buttons=self._task_buttons(task),
+                )
             )
         elif result == "invalid":
             await event.reply(
@@ -621,8 +642,7 @@ class CommandMixin:
                     operation="切换流式传输",
                     note="当前任务状态不支持切换流式模式",
                     task=task,
-                ),
-                buttons=self._task_buttons(task),
+                )
             )
         else:
             await event.reply(
@@ -631,8 +651,7 @@ class CommandMixin:
                     operation="切换流式传输",
                     note="已重新排队；中断后通常需要从头传输",
                     task=task,
-                ),
-                buttons=self._task_buttons(task),
+                )
             )
 
     def _is_orphan_staging(self, task_id: int, remote_path: str) -> bool:
@@ -672,8 +691,7 @@ class CommandMixin:
                 "使用说明\n\n"
                 "只读巡检：/orphans\n"
                 "准备清理：/orphans clean\n"
-                "确认清理：按 Bot 返回的一次性确认码操作",
-                buttons=self._secondary_buttons(b"menu:orphans"),
+                "确认清理：按 Bot 返回的一次性确认码操作"
             )
             return
         if len(parts) == 3:
@@ -682,25 +700,20 @@ class CommandMixin:
         try:
             orphans = await self._find_orphan_staging()
         except NotImplementedError:
-            await event.reply(
-                "临时巡检\n\n巡检结果：当前目的端不支持巡检",
-                buttons=self._secondary_buttons(b"menu:orphans"),
-            )
+            await event.reply("临时巡检\n\n巡检结果：当前目的端不支持巡检")
             return
         except Exception as exc:  # noqa: BLE001 - external diagnostic boundary
             self.log.warning("远端临时文件巡检失败：%s", exc)
             await event.reply(
                 "临时巡检\n\n巡检结果：远端巡检失败\n"
-                "安全处理：未执行任何删除操作",
-                buttons=self._secondary_buttons(b"menu:orphans"),
+                "安全处理：未执行任何删除操作"
             )
             return
         if not orphans:
             await event.reply(
                 "临时巡检\n\n"
                 "巡检结果：没有发现疑似遗留文件\n"
-                "安全处理：本次只读检查，没有删除内容",
-                buttons=self._secondary_buttons(b"menu:orphans"),
+                "安全处理：本次只读检查，没有删除内容"
             )
             return
         shown = "、".join(f"#{task_id}" for task_id, _ in orphans[:20])
@@ -711,8 +724,7 @@ class CommandMixin:
                 f"巡检结果：发现 {len(orphans)} 个疑似遗留文件\n"
                 f"任务编号：{shown}{suffix}\n"
                 "安全处理：本次没有删除任何内容\n"
-                "清理方式：发送 /orphans clean 获取一次性确认码",
-                buttons=self._secondary_buttons(b"menu:orphans"),
+                "清理方式：发送 /orphans clean 获取一次性确认码"
             )
             return
         planned = tuple(orphans[:ORPHAN_CLEANUP_LIMIT])
@@ -731,8 +743,7 @@ class CommandMixin:
             f"待清数量：{len(planned)} 个疑似遗留文件{limited}\n"
             "有效时间：5 分钟\n"
             f"确认命令：/orphans clean {token}\n"
-            "安全说明：确认时重新扫描，活动任务文件不会删除",
-            buttons=self._secondary_buttons(b"menu:orphans"),
+            "安全说明：确认时重新扫描，活动任务文件不会删除"
         )
 
     async def _confirm_orphan_cleanup(
@@ -744,16 +755,14 @@ class CommandMixin:
             await event.reply(
                 "清理结果\n\n执行状态：没有执行\n"
                 "失败原因：确认码不存在或已过期\n"
-                "后续操作：请重新发送 /orphans clean",
-                buttons=self._secondary_buttons(b"menu:orphans"),
+                "后续操作：请重新发送 /orphans clean"
             )
             return
         if not secrets.compare_digest(str(plan["token"]), token):
             await event.reply(
                 "清理结果\n\n执行状态：没有执行\n"
                 "失败原因：清理确认码不正确\n"
-                "安全处理：未删除任何内容",
-                buttons=self._secondary_buttons(b"menu:orphans"),
+                "安全处理：未删除任何内容"
             )
             return
         # Consume before any mutation so retries cannot replay a partially used plan.
@@ -765,8 +774,7 @@ class CommandMixin:
             await event.reply(
                 "清理结果\n\n执行状态：清理中止\n"
                 "失败原因：清理前重新巡检失败\n"
-                "安全处理：未删除任何内容，请重新发起巡检",
-                buttons=self._secondary_buttons(b"menu:orphans"),
+                "安全处理：未删除任何内容，请重新发起巡检"
             )
             return
         deleted = 0
@@ -788,8 +796,7 @@ class CommandMixin:
                     f"执行状态：清理在删除 {deleted} 个后停止\n"
                     "失败原因：无法确认下一项已经安全删除\n"
                     f"跳过数量：{protected} 个已消失或受任务保护\n"
-                    "后续操作：请重新执行 /orphans 巡检",
-                    buttons=self._secondary_buttons(b"menu:orphans"),
+                    "后续操作：请重新执行 /orphans 巡检"
                 )
                 return
             deleted += 1
@@ -797,8 +804,7 @@ class CommandMixin:
             "清理结果\n\n"
             "执行状态：清理完成\n"
             f"删除数量：已删除并复查 {deleted} 个遗留临时文件\n"
-            f"跳过数量：跳过 {protected} 个已消失或受任务保护的文件",
-            buttons=self._secondary_buttons(b"menu:orphans"),
+            f"跳过数量：跳过 {protected} 个已消失或受任务保护的文件"
         )
 
     async def _command_retry(
@@ -816,8 +822,7 @@ class CommandMixin:
                     status="操作成功",
                     operation="批量重试失败任务",
                     note=f"已重新排队 {count} 个；取消清理中的任务不会参与",
-                ),
-                buttons=self._main_buttons(),
+                )
             )
             return
         task_id = self._parse_task_id(parts)
@@ -833,8 +838,7 @@ class CommandMixin:
                     operation="重新加入队列",
                     note="满足目的端与资源安全条件后自动开始",
                     task=updated,
-                ),
-                buttons=self._task_buttons(updated),
+                )
             )
         else:
             await event.reply(
@@ -843,8 +847,7 @@ class CommandMixin:
                     operation="重新加入队列",
                     note="当前任务状态不需要手动重试",
                     task=task,
-                ),
-                buttons=self._task_buttons(task),
+                )
             )
 
     def _retry_task(self, task: dict[str, Any]) -> bool:
@@ -1122,13 +1125,13 @@ class CommandMixin:
         if self._destination_ready():
             scope = getattr(self, "destination_scope", "unknown")
             if scope == "target":
-                destination_text = f"目标目录可访问（只读检查，{checked_age}）"
+                destination_text = "目标目录可访问"
             elif scope == "root_fallback":
-                destination_text = f"根目录可访问，目标目录未创建（{checked_age}）"
+                destination_text = "根目录可访问，目标目录未创建"
             elif scope == "root":
-                destination_text = f"WebDAV 根目录可访问（只读检查，{checked_age}）"
+                destination_text = "WebDAV 根目录可访问"
             else:
-                destination_text = f"目录可访问，范围未知（只读检查，{checked_age}）"
+                destination_text = "目录可访问，范围未知"
         else:
             destination_text = f"不可用、检查过期或配置未完成（{checked_age}）"
         return (

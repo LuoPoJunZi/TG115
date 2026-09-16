@@ -1008,13 +1008,17 @@ class TransferService(CommandMixin):
         await self.client.start(bot_token=self.settings.bot_token)
         me = await self.client.get_me()
         self.log.info("Telegram Bot 已登录：@%s", me.username)
+        await self._register_bot_menu()
         self._background = [
             asyncio.create_task(self._resource_loop(), name="resource-loop"),
             asyncio.create_task(self._destination_loop(), name="destination-loop"),
             asyncio.create_task(self._scheduler_loop(), name="scheduler-loop"),
             asyncio.create_task(self._watch_loop(), name="watch-loop"),
         ]
-        await self._notify("🤖 Telegram → 115 服务已启动。发送 /status 查看状态。")
+        await self._notify(
+            "🤖 Telegram → 115 服务已启动。可使用输入框左侧菜单，"
+            "或发送 /status 查看状态。"
+        )
 
     async def stop(self) -> None:
         self._stop.set()

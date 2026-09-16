@@ -35,10 +35,10 @@ jobs:
           python -m unittest discover -s tests -v
 
       - name: Ruff
-        run: uv run --with ruff==0.16.0 ruff check installer.py vps_resources.py payload/app tests
+        run: uv run --with ruff==0.16.0 ruff check installer.py installer_classic.py vps_resources.py payload/app tests
 
       - name: Bandit
-        run: uv run --with bandit==1.9.4 bandit -q -r payload/app installer.py vps_resources.py
+        run: uv run --with bandit==1.9.4 bandit -q -r payload/app installer.py installer_classic.py vps_resources.py
 
       - name: Dependency audit
         run: |
@@ -49,17 +49,19 @@ jobs:
         shell: pwsh
         run: |
           ./build.ps1
-          $result = Join-Path $env:RUNNER_TEMP "tg115-self-test.txt"
-          $process = Start-Process `
-            -FilePath "./dist/TG115-Deployer.exe" `
-            -ArgumentList @("--self-test", "--self-test-result", $result) `
-            -WindowStyle Hidden -Wait -PassThru
-          if ($process.ExitCode -ne 0) {
-            throw "EXE self-test exited with $($process.ExitCode)"
-          }
-          $content = Get-Content -LiteralPath $result -Raw -Encoding utf8
-          if ($content -notmatch "result=OK") {
-            throw "EXE self-test did not report OK"
+          foreach ($edition in @("Modern", "Classic")) {
+            $result = Join-Path $env:RUNNER_TEMP "tg115-$($edition.ToLower())-self-test.txt"
+            $process = Start-Process `
+              -FilePath "./dist/TG115-Deployer-$edition.exe" `
+              -ArgumentList @("--self-test", "--self-test-result", $result) `
+              -WindowStyle Hidden -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "$edition EXE self-test exited with $($process.ExitCode)"
+            }
+            $content = Get-Content -LiteralPath $result -Raw -Encoding utf8
+            if ($content -notmatch "result=OK") {
+              throw "$edition EXE self-test did not report OK"
+            }
           }
 
   linux-payload:

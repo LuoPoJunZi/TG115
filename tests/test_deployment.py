@@ -148,10 +148,30 @@ class DeploymentShellTests(unittest.TestCase):
 
 
 class DeploymentStructureTests(unittest.TestCase):
+    def test_windows_build_isolates_dll_dependency_search_path(self) -> None:
+        script = (SOURCE / "build.ps1").read_text(encoding="utf-8")
+        self.assertIn("function Get-Tg115IsolatedPath", script)
+        self.assertIn('"$env:SystemRoot\\System32"', script)
+        self.assertIn("$env:Path = Get-Tg115IsolatedPath", script)
+        self.assertIn("$env:Path = $originalPath", script)
+
+    def test_windows_build_supports_modern_and_classic_editions(self) -> None:
+        script = (SOURCE / "build.ps1").read_text(encoding="utf-8")
+        self.assertTrue((SOURCE / "installer_classic.py").is_file())
+        self.assertIn("[ValidateSet('All', 'Modern', 'Classic')]", script)
+        self.assertIn("TG115-Deployer-Modern", script)
+        self.assertIn("TG115-Deployer-Classic", script)
+        self.assertIn("installer_classic.py", script)
+        self.assertIn("import tkinter as tk", script)
+        self.assertIn("Initialize-Tg115TkEnvironment", script)
+        self.assertIn("$env:TCL_LIBRARY", script)
+        self.assertIn("$env:TK_LIBRARY", script)
+        self.assertIn("dist\\TG115-Deployer.exe", script)
+
     def test_windows_deploy_reprobes_resources_before_remote_mutation(self) -> None:
         source = (SOURCE / "installer.py").read_text(encoding="utf-8")
-        deploy = source.split("    def deploy(self) -> None:", 1)[1].split(
-            "    def open_clouddrive(self) -> None:", 1
+        deploy = source.split("        def deploy(self, values:", 1)[1].split(
+            "        def open_clouddrive(self, values:", 1
         )[0]
         self.assertLess(
             deploy.index("_probe_and_recommend"), deploy.index("mkdir -m 700")

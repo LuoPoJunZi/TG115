@@ -5,6 +5,7 @@ import asyncio
 import base64
 import http.server
 import os
+import shlex
 import socket
 import sqlite3
 import sys
@@ -36,13 +37,20 @@ from app.verify_destination import verify_destination
 
 from installer import (
     APP_VERSION,
+    DEFAULTS,
     MANAGED_CD2_WEBDAV_URL,
-    InstallerApp,
+    InstallerBackend,
+    InstallerWindow,
+    Redactor,
+    RemoteSession,
     Tunnel,
     b64,
+    make_app,
     packaged_self_test,
     re_safe_remote_stage,
 )
+from installer_classic import APP_VERSION as CLASSIC_APP_VERSION
+from installer_classic import UI_VERSION as CLASSIC_UI_VERSION
 from vps_resources import (
     GIB,
     PROBE_BEGIN,
@@ -83,6 +91,15 @@ def valid_installer_values() -> dict[str, str]:
         "timezone": "Asia/Shanghai",
         "deploy_clouddrive2": "true",
     }
+
+
+def make_installer_backend(**kwargs: object) -> InstallerBackend:
+    return InstallerBackend(
+        log=kwargs.pop("log", Mock()),
+        confirm_host_key=kwargs.pop("confirm_host_key", Mock(return_value=True)),
+        publish_resources=kwargs.pop("publish_resources", Mock()),
+        **kwargs,
+    )
 
 
 def sample_vps_resources(
@@ -127,6 +144,59 @@ def sample_vps_resources(
 
 
 class InstallerHelpersTests(unittest.TestCase):
+    def test_qt_preview_exposes_the_complete_configuration_contract(self) -> None:
+        app = make_app()
+        window = InstallerWindow(preview=True)
+        try:
+            self.assertEqual(window.snapshot(), DEFAULTS)
+            window.auth_group.button(1).click()
+            app.processEvents()
+            self.assertEqual(window.snapshot()["auth_method"], "SSH 密钥")
+            self.assertFalse(window.field_boxes["vps_password"].isVisible())
+            self.assertTrue(window.field_boxes["ssh_key_path"].isVisibleTo(window))
+        finally:
+            window.close()
+            app.processEvents()
+
+    def test_redactor_removes_plain_encoded_and_url_credentials(self) -> None:
+        values = valid_installer_values()
+        redactor = Redactor()
+        redactor.update(values)
+        encoded_token = base64.b64encode(values["bot_token"].encode()).decode()
+        text = (
+            f"BOT_TOKEN={values['bot_token']} encoded={encoded_token} "
+            f"https://user:{values['cd2_password']}@dav.example.com/dav"
+        )
+        cleaned = redactor.clean(text)
+        self.assertNotIn(values["bot_token"], cleaned)
+        self.assertNotIn(encoded_token, cleaned)
+        self.assertNotIn(values["cd2_password"], cleaned)
+
+    def test_remote_sudo_wraps_the_whole_command_without_requesting_a_pty(self) -> None:
+        channel = Mock()
+        channel.recv_ready.return_value = False
+        channel.recv_stderr_ready.return_value = False
+        channel.exit_status_ready.return_value = True
+        channel.recv_exit_status.return_value = 0
+        transport = Mock()
+        transport.is_active.return_value = True
+        transport.open_session.return_value = channel
+        session = RemoteSession.__new__(RemoteSession)
+        session.values = {"sudo_password": "sudo-secret"}
+        session.client = SimpleNamespace(get_transport=lambda: transport)
+        command = "INSTALL_DIR=/opt/tg115 bash /tmp/install.sh"
+
+        code, output = session.run(command, sudo=True, timeout=2)
+
+        self.assertEqual((code, output), (0, ""))
+        channel.get_pty.assert_not_called()
+        channel.exec_command.assert_called_once_with(
+            f"sudo -S -p '' -- /bin/bash -c {shlex.quote(command)}"
+        )
+        channel.sendall.assert_called_once_with(b"sudo-secret\n")
+        channel.shutdown_write.assert_called_once()
+        channel.close.assert_called_once()
+
     def test_tunnel_probe_forwards_a_real_http_response(self) -> None:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
@@ -178,32 +248,29 @@ class InstallerHelpersTests(unittest.TestCase):
             tunnel.close()
 
     def test_open_clouddrive_rebuilds_a_stale_tunnel_before_opening(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
-        app._snapshot = Mock(return_value=valid_installer_values())
-        app._validate = Mock()
-        app._run_worker = lambda action: action()
-        app._log = Mock()
-        app.root = Mock()
+        values = valid_installer_values()
         stale = Mock()
         stale.probe.side_effect = RuntimeError("stale tunnel")
-        app.tunnel = stale
         session = Mock()
         session.run.return_value = (0, "")
-        app._new_session = Mock(return_value=session)
         replacement = Mock()
         replacement.url = "http://127.0.0.1:19798"
+        browser_open = Mock()
+        backend = make_installer_backend(
+            session_factory=Mock(return_value=session),
+            tunnel_factory=Mock(return_value=replacement),
+            browser_open=browser_open,
+        )
+        backend.tunnel = stale
+        backend._tunnel_identity = backend.connection_identity(values)
 
-        with (
-            patch("installer.Tunnel", return_value=replacement),
-            patch("installer.webbrowser.open") as browser_open,
-        ):
-            app.open_clouddrive()
+        backend.open_clouddrive(values)
 
         stale.close.assert_called_once()
         replacement.start.assert_called_once()
         replacement.probe.assert_called_once()
         browser_open.assert_called_once_with(replacement.url)
-        self.assertIs(app.tunnel, replacement)
+        self.assertIs(backend.tunnel, replacement)
 
     def test_tunnel_does_not_fall_back_when_local_port_is_occupied(self) -> None:
         listener = socket.socket()
@@ -219,27 +286,39 @@ class InstallerHelpersTests(unittest.TestCase):
         finally:
             listener.close()
 
-    def test_packaged_self_test_rejects_broken_tk(self) -> None:
-        import tkinter as tk
-
+    def test_packaged_self_test_rejects_broken_qt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             result = Path(temp) / "result.txt"
-            with patch("installer.tk.Tk", side_effect=tk.TclError("test-only")):
+            with patch("installer.make_app", side_effect=RuntimeError("test-only")):
                 self.assertEqual(packaged_self_test(result), 1)
             self.assertIn("gui_runtime=FAILED", result.read_text(encoding="utf-8"))
 
     def test_packaged_self_test_checks_gui_and_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             result = Path(temp) / "result.txt"
-            root = Mock()
+            app = Mock()
+            window = Mock()
+            window.snapshot.return_value = dict(DEFAULTS)
             with (
-                patch("installer.tk.Tk", return_value=root),
-                patch("installer.InstallerApp") as app_class,
+                patch("installer.make_app", return_value=app),
+                patch("installer.InstallerWindow", return_value=window) as window_class,
+                patch(
+                    "installer.dependency_report",
+                    return_value={
+                        "modules": {
+                            "PySide6": True,
+                            "paramiko": True,
+                            "vps_resources": True,
+                        },
+                        "payload_missing": [],
+                        "ready": True,
+                    },
+                ),
             ):
                 self.assertEqual(packaged_self_test(result), 0)
-            root.withdraw.assert_called_once()
-            app_class.assert_called_once_with(root)
-            root.destroy.assert_called_once()
+            window_class.assert_called_once_with(preview=True)
+            app.processEvents.assert_called_once()
+            window.close.assert_called_once()
             self.assertIn("result=OK", result.read_text(encoding="utf-8"))
 
     def test_base64_round_trip(self) -> None:
@@ -255,21 +334,21 @@ class InstallerHelpersTests(unittest.TestCase):
         self.assertFalse(re_safe_remote_stage("/tmp/tg115-deploy-" + "a" * 31))
 
     def test_full_validation_rejects_shell_metacharacters_in_install_dir(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         values = valid_installer_values()
         values["install_dir"] = "/opt/tg115;touch /tmp/pwned"
         with self.assertRaisesRegex(ValueError, "安装目录"):
             app._validate(values)
 
     def test_full_validation_rejects_non_finite_disk_values(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         values = valid_installer_values()
         values["local_budget_gb"] = "nan"
         with self.assertRaisesRegex(ValueError, "有限数字"):
             app._validate(values)
 
     def test_public_http_webdav_is_rejected(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         values = valid_installer_values()
         values["deploy_clouddrive2"] = "false"
         values["cd2_url"] = "http://webdav.example.com/dav"
@@ -277,14 +356,14 @@ class InstallerHelpersTests(unittest.TestCase):
             app._validate(values)
 
     def test_private_http_webdav_is_allowed(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         values = valid_installer_values()
         values["deploy_clouddrive2"] = "false"
         values["cd2_url"] = "http://192.168.1.10:19798/dav"
         app._validate(values)
 
     def test_managed_clouddrive_always_uses_internal_webdav_url(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         values = valid_installer_values()
         values["cd2_url"] = "https://203.0.113.10:19798/dav"
         app._validate(values)
@@ -296,7 +375,7 @@ class InstallerHelpersTests(unittest.TestCase):
         self.assertEqual(actual, MANAGED_CD2_WEBDAV_URL)
 
     def test_blank_webdav_relative_target_is_allowed(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         values = valid_installer_values()
         values["cd2_target"] = ""
         app._validate(values)
@@ -307,7 +386,7 @@ class InstallerHelpersTests(unittest.TestCase):
         self.assertEqual(config["CD2_TARGET_PATH_B64"], "")
 
     def test_malformed_webdav_port_is_rejected(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         values = valid_installer_values()
         values["deploy_clouddrive2"] = "false"
         values["cd2_url"] = "http://clouddrive2:not-a-port/dav"
@@ -315,19 +394,17 @@ class InstallerHelpersTests(unittest.TestCase):
             app._validate(values)
 
     def test_install_dir_with_dot_segment_is_rejected(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         values = valid_installer_values()
         values["install_dir"] = "/opt/tg115/./nested"
         with self.assertRaisesRegex(ValueError, "安装目录"):
             app._validate(values)
 
     def test_deploy_runs_full_validation_before_remote_work(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
-        app._snapshot = Mock(return_value=valid_installer_values())
+        app = make_installer_backend()
         app._validate = Mock(side_effect=ValueError("full-validation-marker"))
-        app._run_worker = lambda action: action()
         with self.assertRaisesRegex(ValueError, "full-validation-marker"):
-            app.deploy()
+            app.deploy(valid_installer_values())
         app._validate.assert_called_once()
 
 
@@ -375,7 +452,7 @@ class VpsResourceRecommendationTests(unittest.TestCase):
         self.assertEqual(resources.docker_storage_available_bytes, 42 * GIB)
 
     def test_installer_probe_uses_current_install_path_and_publishes_advice(self) -> None:
-        app = InstallerApp.__new__(InstallerApp)
+        app = make_installer_backend()
         app._publish_resource_advice = Mock()
         session = Mock()
         session.run.side_effect = ((0, "1000\n"), (0, self.probe_output()))
@@ -394,32 +471,16 @@ class VpsResourceRecommendationTests(unittest.TestCase):
         app._publish_resource_advice.assert_called_once()
 
     def test_applying_plan_changes_only_instance_storage_values(self) -> None:
-        class Variable:
-            def __init__(self, value: str):
-                self.value = value
-
-            def get(self) -> str:
-                return self.value
-
-            def set(self, value: str) -> None:
-                self.value = value
-
-        app = InstallerApp.__new__(InstallerApp)
-        app.values = {
-            "install_dir": Variable("/opt/tg115"),
-            "deploy_clouddrive2": Variable("true"),
-            "local_budget_gb": Variable("20"),
-            "min_free_disk_gb": Variable("20"),
-        }
+        app = make_installer_backend()
+        values = valid_installer_values()
         app.storage_advice = recommend_storage(
             sample_vps_resources(total_gb=39, available_gb=30, memory_gb=2.4),
             managed_clouddrive=True,
         )
-        app.storage_probe_basis = ("/opt/tg115", True)
-        app._log = Mock()
-        app._apply_storage_plan("stream_first")
-        self.assertEqual(app.values["local_budget_gb"].get(), "8")
-        self.assertEqual(app.values["min_free_disk_gb"].get(), "8")
+        app.storage_probe_basis = app._storage_probe_basis(values)
+        budget, reserve = app.storage_plan("stream_first", values)
+        self.assertEqual(budget, "8")
+        self.assertEqual(reserve, "8")
 
     def test_probe_rejects_missing_or_duplicate_fields(self) -> None:
         with self.assertRaisesRegex(ValueError, "完整边界"):
@@ -1576,7 +1637,9 @@ class UploadRecoveryTests(unittest.TestCase):
 
 class PayloadTests(unittest.TestCase):
     def test_windows_and_server_versions_match(self) -> None:
-        self.assertEqual(APP_VERSION, "1.6.1")
+        self.assertEqual(APP_VERSION, "1.6.2")
+        self.assertEqual(CLASSIC_APP_VERSION, APP_VERSION)
+        self.assertEqual(CLASSIC_UI_VERSION, "tk-classic-1.0")
         self.assertEqual(__version__, APP_VERSION)
 
     def test_required_payload_files_exist(self) -> None:
