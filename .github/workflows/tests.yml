@@ -49,6 +49,8 @@ jobs:
         timeout-minutes: 20
         shell: pwsh
         run: |
+          $env:TG115_BUILD_PYTHON = (Get-Command python -ErrorAction Stop).Source
+          python --version
           ./build.ps1
           foreach ($edition in @("Modern", "Classic")) {
             $result = Join-Path $env:RUNNER_TEMP "tg115-$($edition.ToLower())-self-test.txt"

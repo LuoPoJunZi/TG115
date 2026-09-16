@@ -180,6 +180,10 @@ class DeploymentStructureTests(unittest.TestCase):
         workflow = (SOURCE / ".github" / "workflows" / "tests.yml").read_text(
             encoding="utf-8"
         )
+        self.assertIn(
+            "$env:TG115_BUILD_PYTHON = (Get-Command python -ErrorAction Stop).Source",
+            workflow,
+        )
         self.assertIn("timeout-minutes: 20", workflow)
         self.assertIn("WaitForExit(120000)", workflow)
 
