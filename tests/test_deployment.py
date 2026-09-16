@@ -170,10 +170,18 @@ class DeploymentStructureTests(unittest.TestCase):
         self.assertIn("TG115-Deployer-Classic", script)
         self.assertIn("installer_classic.py", script)
         self.assertIn("import tkinter as tk", script)
+        self.assertIn("tk.Tcl()", script)
+        self.assertNotIn("root = tk.Tk()", script)
         self.assertIn("Initialize-Tg115TkEnvironment", script)
         self.assertIn("$env:TCL_LIBRARY", script)
         self.assertIn("$env:TK_LIBRARY", script)
         self.assertIn("dist\\TG115-Deployer.exe", script)
+
+        workflow = (SOURCE / ".github" / "workflows" / "tests.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("timeout-minutes: 20", workflow)
+        self.assertIn("WaitForExit(120000)", workflow)
 
     def test_windows_deploy_reprobes_resources_before_remote_mutation(self) -> None:
         source = (SOURCE / "installer.py").read_text(encoding="utf-8")

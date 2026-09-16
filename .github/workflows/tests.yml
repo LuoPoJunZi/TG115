@@ -46,6 +46,7 @@ jobs:
           uv run --with pip-audit==2.10.1 pip-audit -r requirements-build.txt
 
       - name: Build and self-test Windows EXE
+        timeout-minutes: 20
         shell: pwsh
         run: |
           ./build.ps1
@@ -54,7 +55,11 @@ jobs:
             $process = Start-Process `
               -FilePath "./dist/TG115-Deployer-$edition.exe" `
               -ArgumentList @("--self-test", "--self-test-result", $result) `
-              -WindowStyle Hidden -Wait -PassThru
+              -WindowStyle Hidden -PassThru
+            if (-not $process.WaitForExit(120000)) {
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              throw "$edition EXE self-test timed out after 120 seconds"
+            }
             if ($process.ExitCode -ne 0) {
               throw "$edition EXE self-test exited with $($process.ExitCode)"
             }

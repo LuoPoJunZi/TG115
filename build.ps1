@@ -94,10 +94,10 @@ function Invoke-Tg115PythonBuild {
         foreach ($target in $BuildTargets) {
             Write-Host "Building $($target.Name) with $($target.Runtime)..."
             if ($target.Runtime -eq 'PySide6') {
-                & $PythonExecutable -c 'from PySide6.QtWidgets import QApplication; app = QApplication([]); app.quit()'
+                & $PythonExecutable -c 'from PySide6.QtWidgets import QApplication; assert QApplication'
             }
             else {
-                & $PythonExecutable -c 'import tkinter as tk; root = tk.Tk(); root.withdraw(); root.update_idletasks(); root.destroy()'
+                & $PythonExecutable -c 'import tkinter as tk; tcl = tk.Tcl(); assert tcl.eval("info patchlevel")'
             }
             if ($LASTEXITCODE -ne 0) {
                 throw "$($target.Runtime) GUI 运行时不可用，停止生成无法启动的部署器"
@@ -138,11 +138,11 @@ function Invoke-Tg115UvBuild {
             Write-Host "Building $($target.Name) with $($target.Runtime)..."
             if ($target.Runtime -eq 'PySide6') {
                 & $UvExecutable run --with-requirements requirements-build.txt `
-                    python -c 'from PySide6.QtWidgets import QApplication; app = QApplication([]); app.quit()'
+                    python -c 'from PySide6.QtWidgets import QApplication; assert QApplication'
             }
             else {
                 & $UvExecutable run --with-requirements requirements-build.txt `
-                    python -c 'import tkinter as tk; root = tk.Tk(); root.withdraw(); root.update_idletasks(); root.destroy()'
+                    python -c 'import tkinter as tk; tcl = tk.Tcl(); assert tcl.eval("info patchlevel")'
             }
             if ($LASTEXITCODE -ne 0) {
                 throw "$($target.Runtime) GUI 运行时不可用，停止生成无法启动的部署器"
